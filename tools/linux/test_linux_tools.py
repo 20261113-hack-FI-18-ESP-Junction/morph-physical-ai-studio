@@ -93,8 +93,26 @@ class LinuxToolTests(unittest.TestCase):
     def test_unit_quotes_paths_and_escapes_systemd_specifiers(self):
         text = write_unit.unit_text(Path("/tmp/studio 100%"), Path("/tmp/local config.env"))
         self.assertIn('ExecStart="/tmp/studio 100%%/tools/linux/run.sh"', text)
+        self.assertIn('WorkingDirectory=/tmp/studio 100%%/application/backend\n', text)
         self.assertIn('Environment="MORPH_STUDIO_ENV_FILE=/tmp/local config.env"', text)
         self.assertIn("UMask=0077", text)
+
+    @unittest.skipUnless(sys.platform == "linux", "Requires Linux systemd unit validation")
+    def test_generated_unit_passes_systemd_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "studio space 100%"
+            (root / "application/backend").mkdir(parents=True)
+            launcher = root / "tools/linux/run.sh"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("#!/bin/sh\nexit 0\n")
+            launcher.chmod(0o755)
+            unit = Path(directory) / "morph-test.service"
+            unit.write_text(write_unit.unit_text(root, root / "local config.env"))
+            result = subprocess.run(
+                ["systemd-analyze", "--user", "verify", str(unit)],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_unhealthy_response_is_not_accepted(self):
         config = self.config("cpu")

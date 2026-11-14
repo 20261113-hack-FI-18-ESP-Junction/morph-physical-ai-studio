@@ -11,6 +11,8 @@ def quoted(value: str) -> str:
 
 
 def unit_text(root: Path, config: Path) -> str:
+    # This scalar path setting retains quotes literally, unlike ExecStart.
+    backend = str(root / "application/backend").replace("%", "%%")
     return f"""# Managed by Morph tools/linux
 [Unit]
 Description=Morph Physical AI Studio workstation
@@ -18,7 +20,7 @@ After=network.target
 
 [Service]
 Type=exec
-WorkingDirectory={quoted(str(root / 'application/backend'))}
+WorkingDirectory={backend}
 Environment={quoted('MORPH_STUDIO_ENV_FILE=' + str(config))}
 ExecStart={quoted(str(root / 'tools/linux/run.sh'))}
 Restart=on-failure
