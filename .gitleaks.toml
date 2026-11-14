@@ -1,0 +1,15 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public MolmoAct2 repository and pinned Git revision, not credentials"
+condition = "AND"
+paths = [
+  '''^library/src/physicalai/policies/molmoact2/constants\.py$''',
+  '''^library/tests/unit/policies/molmoact2/test_config\.py$''',
+]
+regexTarget = "secret"
+regexes = [
+  '''^allenai/MolmoAct2$''',
+  '''^e432d85f6e039edca44afb93c262f3084ab72a9c$''',
+]
