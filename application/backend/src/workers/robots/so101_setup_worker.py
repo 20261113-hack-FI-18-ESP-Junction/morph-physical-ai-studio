@@ -13,6 +13,7 @@ FeetechMotorsBus connection (with handshake=False) and never touches the DB.
 """
 
 import asyncio
+import sys
 import time
 from contextlib import ExitStack
 from enum import StrEnum
@@ -157,6 +158,8 @@ class SO101SetupWorker(TransportWorker):
         self.phase = SetupPhase.CONNECTING
 
         self.bus: FeetechMotorsBus | None = None
+        # Failed ownership checks must close the port without writing to any motor.
+        self._bus_ready = False
         # Held while the bus is open, so no session or other wizard opens the same device.
         self._device_claim = ExitStack()
         self.port: str | None = None  # Resolved device path (e.g. /dev/ttyACM0)
@@ -274,7 +277,7 @@ class SO101SetupWorker(TransportWorker):
         self.bus = FeetechMotorsBus(port=port, motors=self.motors)
         try:
             async with self._bus_lock:
-                await asyncio.to_thread(self.bus.connect, handshake=False)
+                await asyncio.to_thread(self._open_bus_exclusively)
         except PermissionError as e:
             raise PermissionError(
                 f"Permission denied for port {port}. "
@@ -285,6 +288,18 @@ class SO101SetupWorker(TransportWorker):
             raise ConnectionError(f"Could not open port {port}: {e}") from e
 
         await self._send_phase_status(f"Connected to {port}")
+
+    def _open_bus_exclusively(self) -> None:
+        """Open without motor traffic, then exclude other Linux serial clients."""
+        bus = self._require_bus()
+        bus.connect(handshake=False)
+        if sys.platform == "linux":
+            import fcntl
+            import termios
+
+            # SDK 1.0.0 stores its opened pySerial instance in PortHandler.ser.
+            fcntl.ioctl(bus.port_handler.ser.fileno(), termios.TIOCEXCL)
+        self._bus_ready = True
 
     # ------------------------------------------------------------------
     # Phase: Voltage check
@@ -866,11 +881,15 @@ class SO101SetupWorker(TransportWorker):
         if self.bus is not None:
             try:
                 async with self._bus_lock:
-                    await asyncio.to_thread(self.bus.disconnect)
+                    if self._bus_ready:
+                        await asyncio.to_thread(self.bus.disconnect)
+                    else:
+                        self.bus.port_handler.closePort()
             except Exception:
                 try:
                     self.bus.port_handler.closePort()
                 except Exception:
                     logger.debug("Failed to close motor bus port", exc_info=True)
             self.bus = None
+            self._bus_ready = False
         self._device_claim.close()

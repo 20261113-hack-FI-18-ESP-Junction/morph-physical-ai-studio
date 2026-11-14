@@ -1,10 +1,19 @@
+import asyncio
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import pytest
 from fastapi.testclient import TestClient
+from physicalai.robot import device_id_from_serial_port
+from pydantic import BaseModel
 
+from api import robot_catalog
+from exceptions import RobotDeviceAlreadyOwnedError
 from main import app
 from robots.catalog.assets import resolve_robot_relative_asset_path
 from robots.catalog.registry import RobotCatalogRegistry
+from workers.robot_worker import claim_devices
 
 
 def test_get_robot_catalog_urdf_returns_plugin_file() -> None:
@@ -191,3 +200,75 @@ def test_get_robot_catalog_asset_returns_404_for_missing_file() -> None:
     response = client.get("/api/robots/catalog/SO101_Follower/missing.stl")
 
     assert response.status_code == 404
+
+
+class _IdentifyPayload(BaseModel):
+    serial_number: str
+
+
+@pytest.mark.parametrize("robot_type", ["SO101_Follower", "SO101_Leader"])
+@pytest.mark.parametrize("as_model", [False, True])
+async def test_identify_refuses_a_claimed_so101_before_calling_plugin(monkeypatch, tmp_path, robot_type, as_model):
+    port = str(tmp_path / "serial")
+    resolver = AsyncMock(return_value=port)
+    monkeypatch.setattr(robot_catalog, "find_so101_port", resolver)
+    identify = AsyncMock()
+    definition = SimpleNamespace(type=robot_type, probe=SimpleNamespace(identify=identify))
+    payload = _IdentifyPayload(serial_number="test-arm") if as_model else {"serial_number": "test-arm"}
+
+    with (
+        claim_devices("calibration", (device_id_from_serial_port(port),)),
+        pytest.raises(RobotDeviceAlreadyOwnedError),
+    ):
+        await robot_catalog.identify_robot(definition, object(), payload)
+
+    identify.assert_not_awaited()
+    assert resolver.await_args.args[1].serial_number == "test-arm"
+
+
+@pytest.mark.parametrize("plugin_fails", [False, True])
+async def test_identify_holds_claim_until_plugin_finishes_then_releases(monkeypatch, tmp_path, plugin_fails):
+    port = str(tmp_path / "serial")
+    device_ids = (device_id_from_serial_port(port),)
+    monkeypatch.setattr(robot_catalog, "find_so101_port", AsyncMock(return_value=port))
+
+    async def identify(*args):
+        await asyncio.sleep(0)
+        with pytest.raises(RobotDeviceAlreadyOwnedError), claim_devices("other-worker", device_ids):
+            pytest.fail("Identify released the device while the plugin was still running")
+        if plugin_fails:
+            raise RuntimeError("test plugin failure")
+
+    definition = SimpleNamespace(type="SO101_Follower", probe=SimpleNamespace(identify=identify))
+    if plugin_fails:
+        with pytest.raises(RuntimeError, match="test plugin failure"):
+            await robot_catalog.identify_robot(definition, object(), {"connection_string": port})
+    else:
+        await robot_catalog.identify_robot(definition, object(), {"connection_string": port})
+
+    with claim_devices("next-worker", device_ids):
+        pass
+
+
+async def test_identify_does_not_change_other_robot_types(monkeypatch):
+    resolver = AsyncMock()
+    monkeypatch.setattr(robot_catalog, "find_so101_port", resolver)
+    identify = AsyncMock()
+    definition = SimpleNamespace(type="Other_Follower", probe=SimpleNamespace(identify=identify))
+    manager, payload = object(), {"connection_string": "other-connection"}
+
+    await robot_catalog.identify_robot(definition, manager, payload, "gripper")
+
+    resolver.assert_not_awaited()
+    identify.assert_awaited_once_with(payload, manager, "gripper")
+
+
+async def test_identify_unresolved_so101_never_calls_plugin(monkeypatch):
+    monkeypatch.setattr(robot_catalog, "find_so101_port", AsyncMock(return_value=None))
+    identify = AsyncMock()
+    definition = SimpleNamespace(type="SO101_Follower", probe=SimpleNamespace(identify=identify))
+
+    with pytest.raises(ValueError, match="Could not resolve"):
+        await robot_catalog.identify_robot(definition, object(), {"serial_number": "missing"})
+
+    identify.assert_not_awaited()

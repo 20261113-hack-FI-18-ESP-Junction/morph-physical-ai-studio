@@ -1,8 +1,14 @@
+import asyncio
+from collections.abc import AsyncIterator, Coroutine
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from uuid import uuid4
 
 from fastapi import APIRouter, Body, Depends
 from fastapi.responses import FileResponse
+from physicalai.robot import device_id_from_serial_port
+from physicalai_so101_plugin.studio_catalog import find_so101_port
 from physicalai_studio_plugin import RobotCatalogDefinition
 from pydantic import BaseModel, Field
 
@@ -10,6 +16,7 @@ from api.dependencies import RobotCatalogServiceDep, RobotConnectionManagerDep
 from exceptions import ResourceNotFoundError, ResourceType, RobotIdentifyError
 from robots.catalog.assets import resolve_robot_relative_asset_path, resolve_robot_urdf_path
 from schemas import SerialPortInfo
+from workers.robot_worker import claim_devices
 
 
 class RobotZeroCalibrationResponse(BaseModel):
@@ -78,11 +85,55 @@ ProbePayloadDep = Annotated[BaseModel | dict[str, Any], Depends(_validate_probe_
 
 
 router = APIRouter(prefix="/api/robots/catalog", tags=["Robot Catalog"])
+SO101_TYPES = frozenset({"SO101_Follower", "SO101_Leader"})
 
 
 def _is_so101_overload_protection_error(error: RuntimeError) -> bool:
     """Return whether a plugin error represents the SO101 identify recovery action."""
     return "stopped responding during motion" in str(error) and "overload protection" in str(error)
+
+
+@asynccontextmanager
+async def _claim_identify_device(
+    robot_type: str,
+    robot_manager: RobotConnectionManagerDep,
+    payload: BaseModel | dict[str, Any],
+) -> AsyncIterator[None]:
+    """Keep SO101 identification from opening a device held by another worker."""
+    if robot_type not in SO101_TYPES:
+        yield
+        return
+
+    values = payload.model_dump() if isinstance(payload, BaseModel) else payload
+    port = await find_so101_port(
+        robot_manager,
+        SerialPortInfo(
+            connection_string=values.get("connection_string") or None,
+            serial_number=values.get("serial_number") or None,
+        ),
+    )
+    if port is None:
+        raise ValueError("Could not resolve the SO101 serial device for identification")
+    with claim_devices(f"studio-identify-{uuid4().hex}", (device_id_from_serial_port(port),)):
+        yield
+
+
+async def _complete_identify(operation: Coroutine[Any, Any, None]) -> None:
+    """Keep ownership until thread-backed motor activity ends, even on cancellation."""
+    task = asyncio.create_task(operation)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break  # Retrieve the plugin error below, after its task has completed.
+    if cancelled:
+        if not task.cancelled():
+            task.exception()
+        raise asyncio.CancelledError
+    task.result()
 
 
 @router.get("")
@@ -117,7 +168,12 @@ async def identify_robot(
             message=f"Robot type {definition.type} does not support identification.",
         )
     try:
-        await definition.probe.identify(payload, robot_manager, joint)
+        async with _claim_identify_device(definition.type, robot_manager, payload):
+            operation = definition.probe.identify(payload, robot_manager, joint)
+            if definition.type in SO101_TYPES:
+                await _complete_identify(operation)
+            else:
+                await operation
     except RuntimeError as error:
         if _is_so101_overload_protection_error(error):
             raise RobotIdentifyError(str(error)) from error
