@@ -1,0 +1,161 @@
+# Contributing to Physical AI Studio
+
+## Getting Started
+
+This is a monorepo with three main components:
+
+| Component                    | Location               | Documentation                                    | Description                                    |
+| ---------------------------- | ---------------------- | ------------------------------------------------ | ---------------------------------------------- |
+| **Library** (VLA framework)  | `library/`             | [library/README.md](./library/README.md)         | Core vision-language-action policy framework   |
+| **Backend** (FastAPI server) | `application/backend/` | [application/README.md](./application/README.md) | API server built on top of the library         |
+| **Frontend** (React UI)      | `application/ui/`      | [application/README.md](./application/README.md) | Web interface for interacting with the backend |
+
+The library is standalone, while the application (backend + frontend) provides a GUI on top of it.
+
+Each project has its own virtual environment, dependencies, and setup instructions.
+
+### Testing Local Runtime and Plugin Changes
+
+When developing a robot or camera plugin, use `uv run --with-editable` to test your local checkout in Studio without changing either project's `pyproject.toml` or reverting dependency settings before a PR.
+
+From the repository root, start the backend with temporary overrides for the Runtime and the plugin you are developing. For example, to test the first-party SO101 plugin:
+
+```bash
+cd application/backend
+PHYSICALAI_CHECKOUT=/absolute/path/to/physicalai
+
+uv run --frozen --extra xpu \
+  --with-editable "$PHYSICALAI_CHECKOUT" \
+  --with-editable "$PHYSICALAI_CHECKOUT/packages/physicalai-so101-plugin" \
+  physicalai-studio serve
+```
+
+- Replace `xpu` with `cpu` or `cuda` for your hardware, and replace the plugin path as needed.
+- Editable packages use your local Python source changes; restart the backend to load changes unless your development server reloads them automatically.
+- Overrides apply only to that invocation and are not saved to dependency manifests or lockfiles. `--frozen` prevents updating `uv.lock`; the existing lockfile must already be suitable for the base Studio environment.
+- Studio's backend and its editable `physicalai-train` dependency share one environment, so you do not need to override Runtime sources in `library/pyproject.toml` too.
+- Include the same override flags when running backend tests. When running commands separately from `library/`, pass the Runtime override there as well.
+
+Run Studio without the `--with-editable` flags to use its declared dependencies again. Temporary overrides are useful for development, but you must still verify that the published Runtime and plugin versions satisfy the project's dependency requirements before merging.
+
+See uv's [per-invocation dependency documentation](https://docs.astral.sh/uv/concepts/projects/run/#requesting-additional-dependencies) for details.
+
+## Code Quality
+
+We use [prek](https://prek.j178.dev/) (Rust-based pre-commit) for code quality hooks.
+
+### Install prek
+
+```bash
+# Using cargo
+cargo install prek
+
+# Or using the install script
+curl -fsSL https://prek.j178.dev/install.sh | sh
+```
+
+### Install Git Hooks
+
+```bash
+prek install
+```
+
+### Run Hooks Manually
+
+```bash
+# All files
+prek run --all-files
+
+# Library only
+prek run --all-files library/
+
+# Backend only
+prek run --all-files application/backend/
+
+# Staged files (default)
+prek run
+```
+
+## Commit Messages
+
+Use [conventional commits](https://www.conventionalcommits.org/):
+
+- `feat:` - new features
+- `fix:` - bug fixes
+- `docs:` - documentation changes
+- `refactor:` - code refactoring
+- `test:` - adding tests
+- `chore:` - maintenance tasks
+
+Write clear, concise messages. Reference issue numbers when applicable.
+
+## Pull Requests
+
+- Follow conventional commit format for PR title
+- Fill out the PR template completely
+- Provide usage examples for new features
+- Note any breaking changes
+
+## Coding Standards
+
+See [docs/development/coding-standards.md](./docs/development/coding-standards.md) for repo-wide coding standards.
+
+For `library/` code, also follow [library/docs/development/security.md](./library/docs/development/security.md).
+
+---
+
+## License
+
+Physical AI Studio is licensed under the terms in [LICENSE](./LICENSE). By contributing to the project, you agree to the license and copyright terms therein and release your contribution under these terms.
+
+## Sign Your Work
+
+Please use the sign-off line at the end of the patch. Your signature certifies that you wrote the patch or otherwise have the right to pass it on as an open-source patch. The rules are pretty simple: if you can certify the below (from [developercertificate.org](http://developercertificate.org/)):
+
+```
+Developer Certificate of Origin
+Version 1.1
+
+Copyright (C) 2004, 2006 The Linux Foundation and its contributors.
+660 York Street, Suite 102,
+San Francisco, CA 94110 USA
+
+Everyone is permitted to copy and distribute verbatim copies of this
+license document, but changing it is not allowed.
+
+Developer's Certificate of Origin 1.1
+
+By making a contribution to this project, I certify that:
+
+(a) The contribution was created in whole or in part by me and I
+    have the right to submit it under the open source license
+    indicated in the file; or
+
+(b) The contribution is based upon previous work that, to the best
+    of my knowledge, is covered under an appropriate open source
+    license and I have the right under that license to submit that
+    work with modifications, whether created in whole or in part
+    by me, under the same open source license (unless I am
+    permitted to submit under a different license), as indicated
+    in the file; or
+
+(c) The contribution was provided directly to me by some other
+    person who certified (a), (b) or (c) and I have not modified
+    it.
+
+(d) I understand and agree that this project and the contribution
+    are public and that a record of the contribution (including all
+    personal information I submit with it, including my sign-off) is
+    maintained indefinitely and may be redistributed consistent with
+    this project or the open source license(s) involved.
+```
+
+Then you just add a line to every git commit message:
+
+```
+Signed-off-by: Joe Smith <joe.smith@email.com>
+```
+
+Use your real name (sorry, no pseudonyms or anonymous contributions.)
+
+If you set your `user.name` and `user.email` git configs, you can sign your commit automatically with `git commit -s`.

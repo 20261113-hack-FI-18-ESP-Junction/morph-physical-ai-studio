@@ -1,0 +1,348 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+
+"""Lightning datamodules."""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import fields
+from typing import TYPE_CHECKING, Any, Literal
+
+import numpy as np
+import torch
+from lightning.pytorch import LightningDataModule
+from torch.utils.data import DataLoader, Dataset
+
+from physicalai.data.gym import GymDataset
+from physicalai.data.observation import Observation
+from physicalai.gyms.step_limit import with_step_limit
+
+if TYPE_CHECKING:
+    from physicalai.data import Dataset
+    from physicalai.gyms import Gym
+
+logger = logging.getLogger(__name__)
+
+#: Maximum number of workers used by the ``"auto"`` heuristic.
+_AUTO_NUM_WORKERS_CAP = 8
+
+
+def resolve_auto_num_workers() -> int:
+    """Resolve the number of DataLoader workers for ``"auto"`` mode.
+
+    Returns:
+        int: Number of workers to use.
+    """
+    cpu_count = os.cpu_count()
+    if cpu_count is None:
+        return 0
+    return min(cpu_count, _AUTO_NUM_WORKERS_CAP)
+
+
+def _collate_gym(batch: list[Any]) -> Gym:
+    """Collate a batch of environments into a single Gym environment.
+
+    Args:
+        batch: A list containing a single Gym environment.
+
+    Returns:
+        Gym: The gym environment (unwrapped from batch list).
+    """
+    # batch is a list with one item: [env], return it directly
+    return batch[0]
+
+
+def _collate_observations(batch: list[Observation]) -> Observation:
+    """Collate a batch of Observations into a single batched Observation.
+
+    Args:
+        batch (list[Observation]): A list containing Observations.
+
+    Returns:
+        Observation: A single Observation with batched tensors.
+    """
+    if not batch:
+        return Observation()
+
+    collated_data: dict[str, Any] = {}
+
+    # Iterate through all fields defined in the Observation dataclass
+    for field in fields(Observation):
+        key = field.name
+        values = [getattr(elem, key) for elem in batch]
+
+        # Filter out None values to determine the data type
+        non_none_values = [v for v in values if v is not None]
+
+        if not non_none_values:
+            collated_data[key] = None
+            continue
+
+        first_non_none = non_none_values[0]
+
+        # Handle tensors and NumPy arrays
+        if isinstance(first_non_none, (torch.Tensor, np.ndarray)):
+            # Convert NumPy arrays to PyTorch tensors before stacking
+            tensors_to_stack = [torch.from_numpy(v) if isinstance(v, np.ndarray) else v for v in non_none_values]
+            collated_data[key] = torch.stack(tensors_to_stack, dim=0)
+
+        # Handle nested dictionaries, such as the `images` field
+        elif isinstance(first_non_none, dict):
+            collated_inner_dict = {}
+            for inner_key in first_non_none:
+                inner_values = [d.get(inner_key) for d in values if d is not None]
+                if inner_values:
+                    first_inner_value = inner_values[0]
+                    # Only stack if the values are tensors or arrays
+                    if isinstance(first_inner_value, (torch.Tensor, np.ndarray)):
+                        tensors_to_stack = [
+                            torch.from_numpy(v) if isinstance(v, np.ndarray) else v for v in inner_values
+                        ]
+                        collated_inner_dict[inner_key] = torch.stack(tensors_to_stack, dim=0)
+                    else:
+                        # For non-tensor values (like strings), just keep them as a list
+                        collated_inner_dict[inner_key] = inner_values
+            collated_data[key] = collated_inner_dict
+
+        # Handle primitive types like booleans, integers, and floats
+        elif isinstance(first_non_none, (bool, int, float)):
+            collated_data[key] = torch.tensor(non_none_values)
+
+        # Fallback for other types, like strings
+        else:
+            collated_data[key] = values
+
+    return Observation(**collated_data)
+
+
+class DataModule(LightningDataModule):
+    """PyTorch Lightning DataModule for action datasets and Gym environments.
+
+    Handles training, evaluation, and test datasets, including Gym environments
+    wrapped as datasets. Provides DataLoaders for training, validation, and testing.
+
+    Supports two validation modes:
+    - **Gym-based**: Set ``val_gym`` to run environment rollouts during validation.
+    - **Eval-loss**: Set ``val_eval_dataset`` to compute validation loss on a held-out dataset split.
+
+    When both are provided, ``val_eval_dataset`` takes precedence (eval-loss mode).
+    """
+
+    def __init__(
+        self,
+        train_dataset: Dataset,
+        train_batch_size: int = 16,
+        num_workers: int | Literal["auto"] = "auto",
+        val_gym: Gym | None = None,
+        num_rollouts_val: int = 10,
+        val_eval_dataset: Dataset | None = None,
+        val_batch_size: int | None = None,
+        test_gym: Gym | None = None,
+        num_rollouts_test: int = 10,
+        max_episode_steps: int | None = 300,
+        pin_memory: bool | Literal["auto"] = "auto",  # noqa: FBT001
+        persistent_workers: bool = True,  # noqa: FBT001, FBT002
+        val_persistent_workers: bool = False,  # noqa: FBT001, FBT002
+    ) -> None:
+        """Initialize the ActionDataModule.
+
+        Args:
+            train_dataset (ActionDataset): Dataset for training.
+            train_batch_size (int): Batch size for training DataLoader.
+            num_workers (int | Literal["auto"]): Number of DataLoader workers.
+                ``"auto"`` (default) uses ``min(cpu_count, 8)``.
+            val_gym (Gym | None): Validation environment.
+            num_rollouts_val (int): Number of rollouts to run for validation environments.
+            val_eval_dataset (Dataset | None): Validation dataset for computing eval loss.
+                When provided, validation computes loss on this dataset instead of gym rollouts.
+            val_batch_size (int | None): Batch size for the eval-loss validation DataLoader.
+                ``None`` (default) tracks ``train_batch_size``, including any value chosen by
+                ``auto_scale_batch_size``.
+            test_gym (Gym | None): Test environment.
+            num_rollouts_test (int): Number of rollouts to run for test environments.
+            max_episode_steps (int, None): Maximum steps allowed per episode. If None, no time limit.
+            pin_memory (bool | Literal["auto"]): Whether to use pinned (page-locked) memory for the
+                training and eval-loss validation DataLoaders, which speeds up host-to-GPU transfers.
+                ``"auto"`` (default) enables it only when an accelerator (CUDA/XPU/etc.) is available,
+                avoiding PyTorch's ``pin_memory=True`` warning on CPU-only setups.
+            persistent_workers (bool): Whether to keep training DataLoader worker processes alive
+                between epochs, avoiding the cost of re-spawning them every epoch. Has no effect
+                when ``num_workers`` resolves to ``0``. Defaults to `True`.
+            val_persistent_workers (bool): Same as ``persistent_workers`` but for the eval-loss
+                validation DataLoader. Defaults to `False`, since validation runs far less often
+                than training and keeping its workers alive for the whole run has limited benefit
+                relative to the extra worker processes it holds open.
+        """
+        super().__init__()
+
+        # dataset
+        self.train_dataset: Dataset = train_dataset
+        self.train_batch_size: int = train_batch_size
+        self.num_workers: int = resolve_auto_num_workers() if num_workers == "auto" else num_workers
+        self._pin_memory: bool | Literal["auto"] = pin_memory
+        self.persistent_workers: bool = persistent_workers and self.num_workers > 0
+        self.val_persistent_workers: bool = val_persistent_workers and self.num_workers > 0
+        logger.info("DataLoader workers: %d%s", self.num_workers, " (auto)" if num_workers == "auto" else "")
+
+        # eval-loss validation dataset
+        self.val_eval_dataset: Dataset | None = val_eval_dataset
+        self._val_batch_size: int | None = val_batch_size
+
+        # gym environments
+        self.val_gym: Gym | None = val_gym
+        self.val_dataset: Dataset | None = None
+        self.num_rollouts_val: int = num_rollouts_val
+        self.test_gym: Gym | None = test_gym
+        self.test_dataset: Dataset | None = None
+        self.num_rollouts_test: int = num_rollouts_test
+        self.max_episode_steps = max_episode_steps
+
+        # setup time limit if max_episode steps (0 or None will fail)
+        if self.max_episode_steps:
+            self.val_gym = with_step_limit(self.val_gym, max_steps=self.max_episode_steps) if self.val_gym else None
+            self.test_gym = with_step_limit(self.test_gym, max_steps=self.max_episode_steps) if self.test_gym else None
+
+    @property
+    def batch_size(self) -> int:
+        """Alias for ``train_batch_size``.
+
+        Lightning's ``Tuner.scale_batch_size`` reads and writes this attribute.
+        """
+        return self.train_batch_size
+
+    @batch_size.setter
+    def batch_size(self, value: int) -> None:
+        self.train_batch_size = value
+
+    @property
+    def val_batch_size(self) -> int:
+        """Effective eval-loss validation batch size.
+
+        Resolves to ``train_batch_size`` when not set explicitly. Read lazily so it
+        reflects a value chosen by ``auto_scale_batch_size``, which mutates
+        ``train_batch_size`` at fit time after ``__init__``.
+        """
+        return self._val_batch_size if self._val_batch_size is not None else self.train_batch_size
+
+    @val_batch_size.setter
+    def val_batch_size(self, value: int | None) -> None:
+        self._val_batch_size = value
+
+    @property
+    def pin_memory(self) -> bool:
+        """Effective ``pin_memory`` setting for train/val DataLoaders.
+
+        Resolves ``"auto"`` lazily (each access) to whether an accelerator (CUDA/XPU/etc.)
+        is currently available, so the check happens per-process (relevant for spawned
+        DataLoader workers) rather than once at construction time.
+        """
+        if self._pin_memory == "auto":
+            return torch.accelerator.is_available()
+        return self._pin_memory
+
+    @pin_memory.setter
+    def pin_memory(self, value: bool | Literal["auto"]) -> None:
+        self._pin_memory = value
+
+    def setup(self, stage: str) -> None:
+        """Set up datasets depending on the stage (fit or test).
+
+        Args:
+            stage (str): Stage of training ('fit', 'test', etc.).
+        """
+        if stage == "fit" and self.val_gym and self.val_eval_dataset is None:
+            self.val_dataset = GymDataset(
+                env=self.val_gym,
+                num_rollouts=self.num_rollouts_val,
+            )
+
+        if stage == "test" and self.test_gym:
+            self.test_dataset = GymDataset(
+                env=self.test_gym,
+                num_rollouts=self.num_rollouts_test,
+            )
+
+    def train_dataloader(self) -> DataLoader[Any]:
+        """Return the DataLoader for training.
+
+        Returns:
+            DataLoader[Any]: Training DataLoader.
+        """
+        return DataLoader(
+            self.train_dataset,
+            num_workers=self.num_workers,
+            batch_size=self.train_batch_size,
+            shuffle=True,
+            drop_last=True,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
+            collate_fn=_collate_observations,
+        )
+
+    def val_dataloader(self) -> DataLoader[Any]:
+        """Return the DataLoader for validation.
+
+        Returns an eval-loss DataLoader when ``val_eval_dataset`` is set,
+        a gym DataLoader when ``val_dataset`` (from gym) is set, or an empty
+        DataLoader otherwise.
+
+        Returns:
+            DataLoader[Any]: Validation DataLoader.
+        """
+        # Eval-loss mode: return batched Observations
+        if self.val_eval_dataset is not None:
+            return DataLoader(
+                self.val_eval_dataset,
+                num_workers=self.num_workers,
+                batch_size=self.val_batch_size,
+                shuffle=False,
+                drop_last=False,
+                pin_memory=self.pin_memory,
+                persistent_workers=self.val_persistent_workers,
+                collate_fn=_collate_observations,
+            )
+
+        if self.val_dataset is None:
+            # Return empty dataloader when no validation dataset
+            # This allows training to proceed without validation
+            return DataLoader([], batch_size=1)
+
+        return DataLoader(
+            self.val_dataset,
+            batch_size=1,
+            collate_fn=_collate_gym,  # type: ignore[arg-type]
+            shuffle=False,
+        )
+
+    def test_dataloader(self) -> DataLoader[Any]:
+        """Return the DataLoader for testing.
+
+        If no test dataset is configured, returns an empty DataLoader
+        to allow training to proceed without testing.
+
+        Returns:
+            DataLoader[Any]: Test DataLoader with collate function for Gym environments,
+                           or empty DataLoader if no test dataset is configured.
+        """
+        if self.test_dataset is None:
+            # Return empty dataloader when no test dataset
+            # This allows training to proceed without testing
+            return DataLoader([], batch_size=1)
+
+        return DataLoader(
+            self.test_dataset,
+            batch_size=1,
+            collate_fn=_collate_gym,  # type: ignore[arg-type]
+            shuffle=False,
+        )
+
+    def predict_dataloader(self) -> DataLoader[Any]:
+        """Predict DataLoader is not implemented.
+
+        Raises:
+            NotImplementedError
+        """
+        raise NotImplementedError

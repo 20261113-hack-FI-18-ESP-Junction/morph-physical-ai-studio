@@ -1,0 +1,466 @@
+import copy
+import shutil
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import cv2
+import numpy as np
+import torch
+from lerobot.datasets.dataset_tools import delete_episodes as lerobot_delete_episodes
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.video_utils import VideoDecoderCache, decode_video_frames_torchcodec
+from lerobot.processor import make_default_processors
+from lerobot.processor.pipeline import RobotProcessorPipeline
+from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.feature_utils import build_dataset_frame
+from loguru import logger
+
+from internal_datasets.access_mode import DatasetAccessMode
+from internal_datasets.dataset_client import DatasetClient
+from internal_datasets.lerobot.episode_task import set_episode_task
+from internal_datasets.lerobot.video_encoding_settings import VideoEncodingSettings
+from internal_datasets.mutations.recording_mutation import RecordingMutation
+from schemas import Episode, EpisodeInfo, EpisodeVideo
+from settings import get_settings
+
+EpisodeMetadata = dict[str, Any]
+
+
+class InternalLeRobotDataset(DatasetClient):
+    type: str = "lerobot"
+    path: Path
+    _dataset: LeRobotDataset
+
+    _teleop_action_processor: RobotProcessorPipeline
+    _robot_action_processor: RobotProcessorPipeline
+    _robot_observation_processor: RobotProcessorPipeline
+    _recording_video_encoding_settings: VideoEncodingSettings
+    _access_mode: DatasetAccessMode
+
+    def __init__(
+        self,
+        dataset_path: Path,
+        *,
+        recording_video_encoding_settings: VideoEncodingSettings = VideoEncodingSettings(),
+        access_mode: DatasetAccessMode = DatasetAccessMode.READ_ONLY,
+    ):
+        self.path = dataset_path
+        self._recording_video_encoding_settings = recording_video_encoding_settings
+        self._access_mode = access_mode
+        self.load_dataset()
+
+        self._teleop_action_processor, self._robot_action_processor, self._robot_observation_processor = (
+            make_default_processors()
+        )
+
+    def load_dataset(self) -> None:
+        """Load dataset."""
+        if self._check_repository_exists(self.path):
+            if self._access_mode is DatasetAccessMode.RECORDING_MUTATION:
+                self._dataset = LeRobotDataset.resume(
+                    repo_id=str(uuid4()),
+                    root=self.path,
+                    **self._resolved_recording_video_encoding_settings_write(),
+                )
+            else:
+                self._dataset = LeRobotDataset(
+                    str(uuid4()),
+                    self.path,
+                )
+            self.has_episodes = self._dataset.num_episodes > 0
+
+    def _resolved_recording_video_encoding_settings_write(self) -> dict:
+        return self._recording_video_encoding_settings.to_lerobot_write_kwargs()
+
+    def _resume_for_writing(self, repo_id: str | None = None) -> None:
+        if not self._check_repository_exists(self.path):
+            raise ValueError(f"Cannot resume non-existing dataset at {self.path}")
+
+        resolved_repo_id = repo_id or getattr(getattr(self, "_dataset", None), "repo_id", str(uuid4()))
+        self._dataset = LeRobotDataset.resume(
+            repo_id=resolved_repo_id,
+            root=self.path,
+            **self._resolved_recording_video_encoding_settings_write(),
+        )
+        self.has_episodes = self._dataset.num_episodes > 0
+
+    def resume_dataset(self) -> None:
+        """Load dataset in write mode for appending episodes."""
+        if self._access_mode is not DatasetAccessMode.RECORDING_MUTATION:
+            raise ValueError("Cannot resume dataset in write mode unless access_mode is RECORDING_MUTATION")
+        self._resume_for_writing()
+
+    def create(
+        self,
+        fps: int,
+        features: dict,
+        robot_type: str,
+    ) -> None:
+        """Create LeRobot dataset."""
+        if self._check_repository_exists(self.path):
+            raise Exception(f"Dataset already exists at {self.path}")
+        self._dataset = LeRobotDataset.create(
+            repo_id=str(uuid4()),
+            root=self.path,
+            fps=fps,
+            features=features,
+            robot_type=robot_type,
+            use_videos=True,
+            **self._resolved_recording_video_encoding_settings_write(),
+        )
+        self.has_episodes = False
+
+    def delete_episodes(self, episode_indices: list[int], output_path: Path) -> DatasetClient:
+        """Copy over repo without given episode_indices to output_path."""
+        lerobot_delete_episodes(dataset=self._dataset, episode_indices=episode_indices, output_dir=output_path)
+        return InternalLeRobotDataset(
+            output_path, recording_video_encoding_settings=self._recording_video_encoding_settings
+        )
+
+    def set_episode_task(self, episode_index: int, task: str) -> None:
+        """Make ``task`` the only task of the episode, in place, without touching its videos."""
+        if self._access_mode is not DatasetAccessMode.READ_ONLY:
+            # A recording holds the dataset's metadata in memory and would write it back over the edit.
+            raise ValueError("Cannot edit episode tasks of a dataset opened for recording")
+        if set_episode_task(self.path, episode_index, task):
+            self.load_dataset()
+
+    def get_tasks(self) -> list[str]:
+        """Get Tasks in dataset."""
+        if not self.exists_on_disk:
+            return []
+        return list(self._dataset.meta.tasks.to_dict()["task_index"].keys())
+
+    def get_video_path(self, episode: int, camera: str) -> Path:
+        """Get Video path of specific episode and camera."""
+        metadata = self._dataset.meta
+        full_camera_name = f"observation.images.{camera}"
+        return Path(metadata.root) / Path(metadata.get_video_file_path(episode, full_camera_name))
+
+    def get_video_keys(self) -> list[str]:
+        return list(self._dataset.meta.video_keys)
+
+    def get_episode_thumbnail_png(
+        self,
+        episode_index: int,
+        video_key: str,
+        width: int = 320,
+        height: int = 240,
+    ) -> tuple[bytes, Path] | None:
+        if not self.exists_on_disk:
+            return None
+
+        metadata = self._dataset.meta
+        episode = self._find_episode_metadata(episode_index)
+        if episode is None:
+            return None
+
+        video_path = Path(metadata.root) / Path(metadata.get_video_file_path(episode_index, video_key))
+        if not video_path.is_file():
+            return None
+
+        video_stat = video_path.stat()
+
+        # Only cache thumbnails which are at most 320x240
+        build_thumbnail = (
+            self._cached_thumbnail_png_bytes if width <= 320 and height <= 240 else self._build_thumbnail_png_bytes
+        )
+        try:
+            thumbnail_png = build_thumbnail(
+                str(video_path),
+                episode[f"videos/{video_key}/from_timestamp"],
+                width,
+                height,
+                video_stat.st_mtime_ns,
+                video_stat.st_size,
+                self._dataset.tolerance_s,
+            )
+        except (ImportError, RuntimeError, ValueError, OSError, cv2.error) as exc:
+            # Catch outside the PNG cache so transient decoding failures can be retried.
+            logger.warning("Could not build thumbnail from '{}': {}", video_path, exc)
+            return None
+
+        return thumbnail_png, video_path
+
+    def prepare_for_writing(self) -> None:
+        """Start image writer &"""
+        if self._dataset.writer is None:
+            return
+        if getattr(self._dataset.writer, "_streaming_encoder", None) is not None:
+            logger.info("Streaming encoding enabled; skipping image writer startup")
+            return
+        num_threads = 4 * len(self._dataset.meta.camera_keys)
+        self._dataset.writer.start_image_writer(
+            num_processes=0,
+            num_threads=num_threads,
+        )
+
+    def overwrite(self, source: DatasetClient) -> None:
+        """Overwrite this dataset with the given dataset."""
+        if not isinstance(source, InternalLeRobotDataset):
+            raise ValueError(f"Cannot overwrite lerobot dataset with {source.__class__}")
+
+        if self.path.is_dir():
+            shutil.rmtree(self.path)
+
+        shutil.copytree(source.path, self.path)
+        self.load_dataset()
+
+    def get_episodes(self) -> list[Episode]:
+        """Get episodes of dataset."""
+
+        if not self.exists_on_disk:
+            return []
+
+        episodes = self._get_episode_metadata_list()
+        return [self._build_episode_from_metadata(episode) for episode in episodes]
+
+    def find_episode(self, episode_index: int) -> Episode | None:
+        """Find episode by index or return None."""
+        if not self.exists_on_disk:
+            return None
+
+        episode = self._find_episode_metadata(episode_index)
+        if episode is None:
+            return None
+
+        return self._build_episode_from_metadata(episode)
+
+    def get_episode_infos(self) -> list[EpisodeInfo]:
+        """Get lightweight episode summaries."""
+        if not self.exists_on_disk:
+            return []
+
+        metadata = self._dataset.meta
+        episodes = self._get_episode_metadata_list()
+        return [
+            EpisodeInfo(
+                episode_index=episode["episode_index"],
+                tasks=episode["tasks"],
+                length=episode["length"],
+                fps=metadata.fps,
+                videos=self._build_videos(episode),
+            )
+            for episode in episodes
+        ]
+
+    def add_frame(self, obs: dict, act: dict, task: str) -> None:
+        """Add frame to recording buffer."""
+        frame = self._process_frame(obs, act, task)
+        self._dataset.add_frame(frame)
+
+    def save_episode(self) -> None:
+        """Save current recording buffer as episode."""
+        self._dataset.save_episode()
+
+    def discard_buffer(self) -> None:
+        """Discard current recording buffer."""
+        self._dataset.clear_episode_buffer()
+
+    def teardown(self) -> None:
+        """Finalize dataset or delete if no episodes."""
+        # TODO: Implement a wait for when an episode is still being written, but teardown is called.
+        if self._dataset.num_episodes == 0:
+            logger.info("Removing dataset since it has no episodes")
+            self.delete()
+        else:
+            logger.info("Finalizing")
+            self.finalize()
+
+    def delete(self) -> None:
+        """Delete dataset."""
+        shutil.rmtree(self.path)
+
+    def finalize(self) -> None:
+        """Finalize changes to dataset."""
+        logger.info(f"Finalizing dataset {self.path}")
+        if self._dataset.writer is not None:
+            self._dataset.writer.stop_image_writer()
+        self._dataset.finalize()
+
+    def _process_frame(self, obs: dict, act: dict, task: str) -> dict:
+        obs_processed = self._robot_observation_processor(obs)
+        act_processed_teleop = self._teleop_action_processor((act, obs))
+        action_frame = build_dataset_frame(self._dataset.features, act_processed_teleop, prefix=ACTION)
+        observation_frame = build_dataset_frame(self._dataset.features, obs_processed, prefix=OBS_STR)
+
+        return {**observation_frame, **action_frame, "task": task}
+
+    def start_recording_mutation(self, fps: int, features: dict, robot_type: str) -> RecordingMutation:
+        """Start recording mutation."""
+        # Fail before copying the dataset if PyAV has no usable video encoder.
+        self._resolved_recording_video_encoding_settings_write()
+
+        settings = get_settings()
+        cache_dir = settings.cache_dir / str(uuid4())
+
+        logger.info(f"Creating cache dataset {cache_dir}")
+        cache_dataset = InternalLeRobotDataset(
+            cache_dir,
+            recording_video_encoding_settings=self._recording_video_encoding_settings,
+        )
+        if self.exists_on_disk:
+            shutil.copytree(self.path, cache_dir)
+            cache_dataset._resume_for_writing(getattr(self._dataset, "repo_id", None))
+        else:
+            cache_dataset.create(fps=fps, features=features, robot_type=robot_type)
+
+        return RecordingMutation(self, cache_dataset)
+
+    @property
+    def exists_on_disk(self) -> bool:
+        """Check if repo exists."""
+        return self._check_repository_exists(self.path)
+
+    @staticmethod
+    def _check_repository_exists(repo_path: Path) -> bool:
+        """Check if repository path contains info and therefor exists."""
+        return (repo_path / "meta/info.json").is_file()
+
+    def _build_episode_from_buffer(self, episode: dict | None, task: str) -> Episode:
+        """Build Episode object from buffer and episode dict."""
+        data = self._build_episode_data_from_buffer()
+        if data is None or self._dataset is None:
+            raise Exception("No dataset loaded.")
+
+        end = data["timestamp"][-1]
+        episode_index = data["episode_index"].tolist()[0]
+        video_timestamps = {
+            video_key: EpisodeVideo(start=0, end=end, path="")  # TODO: Implement path
+            for video_key in self._dataset.meta.video_keys
+        }
+        if episode is not None:
+            for video_key in self._dataset.meta.video_keys:
+                offset = episode[f"videos/{video_key}/to_timestamp"][-1]
+                video_timestamps[video_key].start += offset
+                video_timestamps[video_key].end += offset
+
+        action_feature_names = self._dataset.features.get("action", {}).get("names", [])
+        return Episode(
+            episode_index=episode_index,
+            length=len(data["frame_index"]),
+            fps=self._dataset.fps,
+            tasks=[task],
+            actions=data["action"].tolist(),
+            videos=video_timestamps,
+            action_keys=action_feature_names,
+        )
+
+    def _build_episode_data_from_buffer(self) -> dict:
+        """Build episode data from the buffer.
+
+        LeRobotDataset V3 doesnt update episode data on save.
+        In order to get the episode data we duplicate the actions that happen inside.
+        """
+        if self._dataset is None:
+            raise Exception("No dataset loaded.")
+
+        episode_buffer = self._get_episode_buffer_snapshot()
+        if episode_buffer is None:
+            raise Exception("Attempting to save episode, but no episode in buffer.")
+
+        episode_length = episode_buffer.pop("size")
+        tasks = episode_buffer.pop("task")
+        episode_tasks = list(set(tasks))
+        episode_index = episode_buffer["episode_index"]
+
+        episode_buffer["index"] = np.arange(
+            self._dataset.meta.total_frames, self._dataset.meta.total_frames + episode_length
+        )
+        episode_buffer["episode_index"] = np.full((episode_length,), episode_index)
+
+        # Update tasks and task indices with new tasks if any
+        self._dataset.meta.save_episode_tasks(episode_tasks)
+
+        # Given tasks in natural language, find their corresponding task indices
+        episode_buffer["task_index"] = np.array([self._dataset.meta.get_task_index(task) for task in tasks])
+
+        for key, ft in self._dataset.features.items():
+            # index, episode_index, task_index are already processed above, and image and video
+            # are processed separately by storing image path and frame info as meta data
+            if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
+                continue
+            episode_buffer[key] = np.stack(episode_buffer[key])
+
+        return episode_buffer
+
+    def _get_episode_actions(self, episode: dict) -> torch.Tensor:
+        """Get episode actions tensor from specific episode."""
+        from_idx = episode["dataset_from_index"]
+        to_idx = episode["dataset_to_index"]
+        actions = self._dataset.hf_dataset["action"][from_idx:to_idx]
+        return torch.stack(actions)
+
+    def _build_videos(self, episode: EpisodeMetadata) -> dict[str, EpisodeVideo]:
+        """Build video info for episode."""
+        metadata = self._dataset.meta
+        return {
+            video_key: EpisodeVideo(
+                start=episode[f"videos/{video_key}/from_timestamp"],
+                end=episode[f"videos/{video_key}/to_timestamp"],
+                path=str(metadata.get_video_file_path(episode["episode_index"], video_key)),
+            )
+            for video_key in metadata.video_keys
+        }
+
+    def _build_episode_from_metadata(self, episode: EpisodeMetadata) -> Episode:
+        metadata = self._dataset.meta
+        action_feature_names = self._dataset.features.get("action", {}).get("names", [])
+        videos = self._build_videos(episode)
+
+        return Episode(
+            actions=self._get_episode_actions(episode).tolist(),
+            fps=metadata.fps,
+            videos=videos,
+            action_keys=action_feature_names,
+            **episode,
+        )
+
+    def _find_episode_metadata(self, episode_index: int) -> EpisodeMetadata | None:
+        episodes = self._get_episode_metadata_list()
+        for episode in episodes:
+            if episode["episode_index"] == episode_index:
+                return episode
+        return None
+
+    def _get_episode_metadata_list(self) -> list[EpisodeMetadata]:
+        return [episode for episode in self._dataset.meta.episodes if isinstance(episode, dict)]
+
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def _cached_thumbnail_png_bytes(
+        video_path: str, start: float, width: int, height: int, mtime_ns: int, size: int, tolerance_s: float
+    ) -> bytes:
+        return InternalLeRobotDataset._build_thumbnail_png_bytes(
+            video_path, start, width, height, mtime_ns, size, tolerance_s
+        )
+
+    @staticmethod
+    def _build_thumbnail_png_bytes(
+        video_path: str, start: float, width: int, height: int, _mtime_ns: int, _size: int, tolerance_s: float
+    ) -> bytes:
+        # OpenCV's bundled FFmpeg can lack software AV1 decoding. Use LeRobot's
+        # CPU decoder, without its global path-only cache which can retain replaced videos.
+        decoder_cache = VideoDecoderCache(max_size=1)
+        try:
+            frames = decode_video_frames_torchcodec(
+                video_path, [start], tolerance_s, decoder_cache=decoder_cache, return_uint8=True
+            )
+        finally:
+            decoder_cache.clear()
+
+        frame = cv2.cvtColor(frames[0].permute(1, 2, 0).numpy(), cv2.COLOR_RGB2BGR)
+        resized = cv2.resize(frame, (width, height))
+        encoded, imagebytes = cv2.imencode(".png", resized)
+        if not encoded:
+            raise RuntimeError(f"Failed to encode thumbnail PNG from '{video_path}'")
+
+        return imagebytes.tobytes()
+
+    def _get_episode_buffer_snapshot(self) -> dict | None:
+        writer = self._dataset.writer
+        if writer is None:
+            return None
+        return copy.deepcopy(writer.episode_buffer)

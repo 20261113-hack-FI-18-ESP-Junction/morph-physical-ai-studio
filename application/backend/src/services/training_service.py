@@ -1,0 +1,139 @@
+import asyncio
+import multiprocessing as mp
+from collections.abc import Awaitable, Callable, Collection
+from queue import Empty
+from uuid import UUID
+
+from loguru import logger
+
+from schemas import Job
+from schemas.base_job import JobStatus, JobType
+from schemas.job import RemoteJobId, RemoteJobIdAdapter, RemoteTrainJobPayload, TrainingTarget
+from services.event_processor import EventType
+from services.job_service import JobService
+from workers.base import ThreadWorker
+
+
+class TrainingTrackingDispatcher(ThreadWorker[None]):
+    """Forward progress updates to the job store and event stream off the hot path.
+
+    Backends call :meth:`report` (a `ProgressReporter`) from the training thread
+    or event loop; the dispatcher thread drains the queue and performs the async
+    DB writes so training is never blocked on I/O.
+    """
+
+    def __init__(
+        self,
+        job_id: UUID,
+        event_queue: mp.Queue,
+        update_progress: Callable[[UUID, int, str | None, dict | None], Awaitable[Job]],
+    ):
+        super().__init__(name=f"TrainingTrackingDispatcher-{job_id}")
+        self.job_id = job_id
+        self.event_queue = event_queue
+        self.queue: mp.Queue = mp.Queue()
+        self.update_progress = update_progress
+
+    async def run_loop(self, context: None) -> None:  # noqa: ARG002
+        while not self.should_stop():
+            if not await self._drain_one():
+                await asyncio.sleep(0.05)
+        while await self._drain_one():
+            pass
+
+    async def _drain_one(self) -> bool:
+        """Apply one queued progress update. Return False when the queue is empty."""
+        try:
+            progress, message, extra_info = self.queue.get_nowait()
+        except Empty:
+            return False
+        job = await self.update_progress(self.job_id, progress, message, extra_info)
+        self.event_queue.put((EventType.JOB_UPDATE, job))
+        return True
+
+    def report(self, progress: int, *, message: str | None = None, extra_info: dict | None = None) -> None:
+        """`ProgressReporter`-compatible entry point used by training backends."""
+        self.queue.put((progress, message, extra_info))
+
+
+class TrainingService:
+    """Reconcile abandoned training executions, preserving remote reattachment."""
+
+    @staticmethod
+    async def abort_orphan_jobs(
+        job_service: JobService, *, exclude_job_ids: Collection[UUID] | None = None
+    ) -> list[Job]:
+        """
+        Reconcile RUNNING training jobs left behind by a previous process.
+
+        Bulk recovery helper; the scheduler uses the training job handler's
+        per-job recovery instead. Remote trainers run independently of Studio,
+        so a RUNNING job that
+        already recorded its ``remote_job_id`` is requeued (back to PENDING) to
+        reattach and mirror progress on the next pickup -- this is what lets a run
+        survive the studio restarting (e.g. the laptop was closed overnight). Any
+        other orphaned RUNNING training job cannot resume and is marked FAILED.
+
+        Args:
+            job_service: Used to list and update RUNNING training jobs.
+            exclude_job_ids: Job ids already handled by another recovery pass.
+
+        Returns:
+            Updated jobs for the caller to publish to subscribed clients.
+        """
+        reconciled: list[Job] = []
+        excluded = frozenset(exclude_job_ids) if exclude_job_ids is not None else frozenset()
+        query = {"status": JobStatus.RUNNING, "type": JobType.TRAINING}
+        running_jobs = await job_service.get_job_list(extra_filters=query)
+        for job in running_jobs:
+            if job.id in excluded:
+                continue
+            reconciled.append(await TrainingService.recover_orphan_job(job, job_service))
+        return reconciled
+
+    @staticmethod
+    async def recover_orphan_job(job: Job, job_service: JobService) -> Job:
+        """Reattach a persisted remote execution or fail abandoned local training."""
+        remote_job_id = TrainingService._reattachable_remote_job_id(job)
+        if remote_job_id is not None:
+            logger.info("Requeuing training job {} to reattach to remote job {}", job.id, remote_job_id)
+            return await job_service.update_job_status(
+                job_id=job.id,
+                status=JobStatus.PENDING,
+                message="Reconnecting to remote training job after restart",
+            )
+        logger.warning("Aborting orphan training job {}", job.id)
+        return await job_service.update_job_status(
+            job_id=job.id,
+            status=JobStatus.FAILED,
+            message=(
+                "Training worker exited before completing the job"
+                if job.status == JobStatus.PENDING
+                else "Job aborted due to application shutdown"
+            ),
+        )
+
+    # Targets whose trainer keeps running independently of the studio process,
+    # and so can be reattached to after a restart via their remote_job_id.
+    _REATTACHABLE_TARGETS = (TrainingTarget.REMOTE,)
+
+    @staticmethod
+    def _reattachable_remote_job_id(job: object) -> RemoteJobId | None:
+        """Return the persisted remote job id for a training job, if any.
+
+        Only `RemoteTrainJobPayload` carries a reattachable `remote_job_id`;
+        class identity already encodes the target, so no separate read of
+        `training_target` is needed here.
+        """
+        payload = getattr(job, "payload", None)
+        if isinstance(payload, RemoteTrainJobPayload):
+            return payload.remote_job_id
+        if isinstance(payload, dict):
+            remote_job_id = payload.get("remote_job_id")
+            if payload.get("training_target") not in {target.value for target in TrainingService._REATTACHABLE_TARGETS}:
+                return None
+            try:
+                return RemoteJobIdAdapter.validate_python(str(remote_job_id))
+            except (TypeError, ValueError, AttributeError):
+                return None
+        return None

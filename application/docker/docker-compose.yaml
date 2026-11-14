@@ -1,0 +1,169 @@
+# ================================================================
+# Physical AI Studio — Docker Compose
+#
+# Uses Docker Compose profiles to select the hardware backend.
+# Set COMPOSE_PROFILES in your .env file (cpu, xpu, or cuda)
+# or pass --profile on the command line:
+#
+#   docker compose --profile cpu up      # CPU (default)
+#   docker compose --profile xpu up      # Intel XPU
+#   docker compose --profile cuda up     # NVIDIA CUDA
+#
+# ================================================================
+
+x-common: &common
+    ports:
+      - "${PORT:-7860}:${PORT:-7860}"
+    environment:
+      - HOST=${HOST:-0.0.0.0}
+      - PORT=${PORT:-7860}
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+    # Room for a follower to park on shutdown (RobotWorker waits up to 40 s) and the rest of the teardown.
+    stop_grace_period: 60s
+
+    # PyTorch DataLoader workers need shared memory (/dev/shm) beyond
+    # Docker's 64 MB default. Using ipc: host shares the host's /dev/shm
+    # (typically 50% of system RAM on Linux), so it scales automatically
+    # with available memory and works across different hardware configs.
+    #
+    # If you prefer an isolated, fixed-size allocation instead, comment
+    # out "ipc: host" and uncomment the line below:
+    # shm_size: 16g
+    ipc: host
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-7860}/api/health')",
+        ]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+    # ============================================================
+    # HARDWARE ACCESS
+    #
+    # Choose ONE of the two modes below by commenting/uncommenting.
+    # Both modes require group_add for device permissions.
+    #
+    # Docker resolves group names against the *container's* /etc/group,
+    # not the host's. The defaults below (dialout, plugdev, video) work
+    # on Debian/Ubuntu hosts where the host GIDs match the container's.
+    # On other distros (e.g. Arch Linux) you must override these with
+    # your host's numeric GIDs — run `application/docker/setup-devices.sh`
+    # to auto-detect and write them to .env.
+    # ============================================================
+
+    group_add:
+      - "${DIALOUT_GID:-dialout}" # serial ports (/dev/ttyACM*)
+      - "${PLUGDEV_GID:-plugdev}" # pluggable USB devices
+      - "${VIDEO_GID:-video}" # cameras & video (/dev/video*)
+      - "${RENDER_GID:-render}" # Intel GPU render nodes
+
+    # Persisted application storage volume
+    volumes:
+      - physical-ai-studio-storage:/app/storage
+      - ${HOME}/.cache/huggingface/lerobot/calibration:/home/appuser/.cache/huggingface/lerobot/calibration:ro
+
+    # --- Option 1: Privileged mode (active by default)
+    # Grants full access to all host devices. Easiest setup, but the
+    # container runs with elevated privileges.
+    # Also covers Intel RealSense cameras via /dev/bus/usb.
+    privileged: true
+
+    # --- Option 2: Non-privileged mode (more secure)
+    # Map only the specific devices the robot needs. More secure since
+    # the container cannot access arbitrary host devices, but you must
+    # update the device list whenever hardware changes.
+    # To switch: comment out "privileged: true" above and uncomment below.
+    # privileged: false
+    # devices:
+    #    # Feetech servo USB connection (e.g., /dev/ttyUSB0)
+    #    - /dev/ttyACM0:/dev/ttyACM0
+    #    - /dev/ttyACM1:/dev/ttyACM1
+    #    - /dev/ttyACM2:/dev/ttyACM2
+    #    # Standard USB cameras (v4l2)
+    #    - /dev/video0:/dev/video0
+    #    - /dev/video2:/dev/video2
+    #    - /dev/video4:/dev/video4
+    #    # Intel RealSense cameras
+    #    # - /dev/bus/usb:/dev/bus/usb
+
+x-common-build: &common-build
+    context: ../../
+    dockerfile: application/docker/Dockerfile
+    additional_contexts:
+      libs: ../../library
+    args:
+      - APP_UID=${APP_UID:-1000}
+      - APP_GID=${APP_GID:-1000}
+      # Set these from the checkout when building a local image, e.g.
+      # GIT_SHA=$(git rev-parse HEAD) GIT_COMMIT_DATE=$(git show -s --format=%cI HEAD).
+      - GIT_SHA=${GIT_SHA:-unknown}
+      - GIT_COMMIT_DATE=${GIT_COMMIT_DATE:-unknown}
+      - GIT_TAG=${GIT_TAG:-}
+      - HTTP_PROXY=${HTTP_PROXY}
+      - HTTPS_PROXY=${HTTPS_PROXY}
+      - NO_PROXY=${NO_PROXY}
+      - http_proxy=${http_proxy}
+      - https_proxy=${https_proxy}
+      - no_proxy=${no_proxy}
+
+services:
+  physical-ai-studio-cpu:
+    <<: *common
+    profiles: [cpu]
+    container_name: physical-ai-studio-cpu
+    image: ${REGISTRY:-ghcr.io/open-edge-platform/}physical-ai-studio-cpu:${IMAGE_TAG:-main}
+    build:
+      <<: *common-build
+      target: physical-ai-studio-cpu
+
+  physical-ai-studio-xpu:
+    <<: *common
+    profiles: [xpu]
+    container_name: physical-ai-studio-xpu
+    image: ${REGISTRY:-ghcr.io/open-edge-platform/}physical-ai-studio-xpu:${IMAGE_TAG:-main}
+    build:
+      <<: *common-build
+      target: physical-ai-studio-xpu
+    environment:
+      - SYCL_CACHE_PERSISTENT=${SYCL_CACHE_PERSISTENT:-1}
+      - SYCL_CACHE_DIR=${SYCL_CACHE_DIR:-'/app/storage/.sycl-cache'}
+      - SYCL_UR_USE_LEVEL_ZERO_V2=${SYCL_UR_USE_LEVEL_ZERO_V2:-0}
+    # --- Non-privileged XPU additions
+    # When running in non-privileged mode, add these to grant
+    # Intel GPU access via /dev/dri/renderD* nodes:
+    # group_add:
+    #   - "${DIALOUT_GID:-dialout}"
+    #   - "${PLUGDEV_GID:-plugdev}"
+    #   - "${VIDEO_GID:-video}"
+    #   - "${RENDER_GID:-render}"   # Intel GPU render nodes
+    # devices:
+    #   - /dev/dri:/dev/dri         # Intel GPU device nodes
+
+  physical-ai-studio-cuda:
+    <<: *common
+    profiles: [cuda]
+    container_name: physical-ai-studio-cuda
+    image: ${REGISTRY:-ghcr.io/open-edge-platform/}physical-ai-studio-cuda:${IMAGE_TAG:-main}
+    build:
+      <<: *common-build
+      target: physical-ai-studio-cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  physical-ai-studio-storage:

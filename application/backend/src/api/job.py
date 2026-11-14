@@ -1,0 +1,151 @@
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, Body, Depends, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, Response
+from loguru import logger
+from sse_starlette import EventSourceResponse
+
+from api.dependencies import get_event_processor_ws, get_job_service, get_model_metrics_service, get_scheduler
+from core.scheduler import Scheduler
+from core.security import require_aws_feature_active
+from schemas import Job
+from schemas.job import RemoteTrainJobPayload, TrainJob, TrainJobPayload
+from schemas.job_response import JobResponse, job_response
+from schemas.operational_issue import OperationalIssue
+from services import JobService, ModelMetricsService
+from services.aws_auth_service import AwsAuthenticationRequiredError, operational_authentication_issue
+from services.event_processor import EventProcessor, EventType
+
+router = APIRouter(prefix="/api/jobs", tags=["Jobs"])
+
+
+@router.get("", response_model=list[JobResponse])
+async def list_jobs(
+    job_service: Annotated[JobService, Depends(get_job_service)],
+) -> list[Job]:
+    """Fetch all jobs."""
+    return await job_service.get_job_list()
+
+
+@router.get("/{job_id}", response_model=JobResponse)
+async def get_job(
+    job_id: UUID,
+    job_service: Annotated[JobService, Depends(get_job_service)],
+) -> Job:
+    """Fetch one job by id."""
+    return await job_service.get_job_by_id(job_id)
+
+
+@router.delete("/{job_id}")
+async def delete_job(
+    job_id: UUID,
+    job_service: Annotated[JobService, Depends(get_job_service)],
+) -> None:
+    """Delete a job. Only allows deleting failed or canceled jobs"""
+    await job_service.delete_job(job_id)
+
+
+@router.post(":train", response_model=JobResponse, responses={400: {"model": OperationalIssue}})
+async def submit_train_job(
+    job_service: Annotated[JobService, Depends(get_job_service)],
+    payload: Annotated[TrainJobPayload, Body()],
+) -> Job | JSONResponse:
+    """Endpoint to submit a training job"""
+    try:
+        return await job_service.submit_train_job(payload=payload)
+    except AwsAuthenticationRequiredError as error:
+        return JSONResponse(status_code=400, content=operational_authentication_issue(error.issue).model_dump())
+
+
+@router.post("/{job_id}:interrupt")
+async def interrupt_job(
+    job_id: UUID,
+    job_service: Annotated[JobService, Depends(get_job_service)],
+    scheduler: Annotated[Scheduler, Depends(get_scheduler)],
+) -> None:
+    """Request interruption using the job type's supported cancellation policy."""
+    updated = await job_service.interrupt_job(job_id, scheduler.cancel_job)
+    if updated is not None:
+        scheduler.event_queue.put((EventType.JOB_UPDATE, updated))
+
+
+@router.get("/{job_id}/model_metrics")
+async def get_model_job_metrics(
+    job_id: UUID,
+    job_service: Annotated[JobService, Depends(get_job_service)],
+    model_metrics_service: Annotated[ModelMetricsService, Depends(get_model_metrics_service)],
+) -> EventSourceResponse:
+    """Stream metric rows and named ``issues`` events containing OperationalIssue arrays."""
+    job = await job_service.get_job_by_id(job_id)
+    metrics_path = await model_metrics_service.get_model_job_metrics_path(job)
+    if metrics_path.exists():
+        return EventSourceResponse(model_metrics_service.tail_csv_file(metrics_path))
+    if (
+        isinstance(job, TrainJob)
+        and isinstance(job.payload, RemoteTrainJobPayload)
+        and job.payload.remote_trainer_url is not None
+        and job.payload.remote_trainer_url.startswith("aws-batch://")
+    ):
+        require_aws_feature_active()
+        return EventSourceResponse(
+            model_metrics_service.tail_batch_csv_file(job.payload.remote_trainer_url, str(job.id))
+        )
+    if (
+        isinstance(job, TrainJob)
+        and isinstance(job.payload, RemoteTrainJobPayload)
+        and job.payload.remote_trainer_url is not None
+        and job.payload.remote_trainer_url.startswith("modal://")
+    ):
+        return EventSourceResponse(
+            model_metrics_service.tail_modal_csv_file(job.payload.remote_trainer_url, str(job.id))
+        )
+    if (
+        isinstance(job, TrainJob)
+        and isinstance(job.payload, RemoteTrainJobPayload)
+        and job.payload.remote_trainer_url is not None
+        and job.payload.remote_trainer_url.startswith(("http://", "https://"))
+        and job.payload.remote_job_id is not None
+    ):
+        return EventSourceResponse(
+            model_metrics_service.tail_remote_csv_file(job.payload.remote_trainer_url, str(job.payload.remote_job_id))
+        )
+    return EventSourceResponse(model_metrics_service.empty_metrics_stream())
+
+
+@router.get("/ws", tags=["WebSocket"], summary="Job updates (WebSocket)", status_code=426)
+async def jobs_websocket_openapi() -> Response:
+    """This endpoint requires a WebSocket connection. Use `wss://` to connect."""
+    return Response(status_code=426)
+
+
+@router.websocket("/ws")
+async def jobs_websocket(
+    websocket: WebSocket,
+    event_processor: Annotated[EventProcessor, Depends(get_event_processor_ws)],
+) -> None:
+    """Robot control websocket."""
+    await websocket.accept()
+
+    async def send_data(event: EventType, payload: Job):
+        """Pass job update through to websocket."""
+        await websocket.send_json(
+            {
+                "event": event,
+                "data": job_response(payload).model_dump(mode="json"),
+            }
+        )
+
+    event_processor.subscribe([EventType.JOB_UPDATE], send_data)
+
+    try:
+        while True:
+            # TODO implement subscribing to specific events
+            data = await websocket.receive_json("text")
+            logger.info(f"Received websocket message: {data}")
+
+    except WebSocketDisconnect:
+        logger.info("Except: disconnected!")
+
+    event_processor.unsubscribe([EventType.JOB_UPDATE], send_data)
+    logger.info("Jobs Websocket handling done...")

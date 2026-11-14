@@ -1,0 +1,296 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+"""Unit tests for DataModule."""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+
+
+class TestResolveAutoNumWorkers:
+    """Tests for the resolve_auto_num_workers helper."""
+
+    def test_returns_cpu_count_when_below_cap(self):
+        from physicalai.data.datamodules import resolve_auto_num_workers
+
+        with patch("physicalai.data.datamodules.os.cpu_count", return_value=4):
+            assert resolve_auto_num_workers() == 4
+
+    def test_caps_at_max_workers(self):
+        from physicalai.data.datamodules import _AUTO_NUM_WORKERS_CAP, resolve_auto_num_workers
+
+        with patch("physicalai.data.datamodules.os.cpu_count", return_value=64):
+            assert resolve_auto_num_workers() == _AUTO_NUM_WORKERS_CAP
+
+    def test_returns_zero_when_cpu_count_is_none(self):
+        from physicalai.data.datamodules import resolve_auto_num_workers
+
+        with patch("physicalai.data.datamodules.os.cpu_count", return_value=None):
+            assert resolve_auto_num_workers() == 0
+
+
+class TestDataModuleBackwardCompatibility:
+    """Tests that DataModule remains constructible with positional arguments."""
+
+    def test_positional_construction(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(dummy_dataset(), 32, 4)
+        assert dm.train_batch_size == 32
+        assert dm.num_workers == 4
+
+
+class TestDataModuleNumWorkers:
+    """Tests for the DataModule num_workers parameter."""
+
+    def test_auto_resolves_num_workers(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), num_workers="auto")
+        assert isinstance(dm.num_workers, int)
+        assert dm.num_workers >= 0
+
+    def test_explicit_num_workers(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), num_workers=2)
+        assert dm.num_workers == 2
+
+    def test_default_is_auto(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        with patch("physicalai.data.datamodules.resolve_auto_num_workers", return_value=6) as mock:
+            dm = DataModule(train_dataset=dummy_dataset())
+            mock.assert_called_once()
+            assert dm.num_workers == 6
+
+
+class TestDataModuleBatchSizeAlias:
+    """Tests for the batch_size property alias (Tuner compatibility)."""
+
+    def test_batch_size_reads_train_batch_size(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), train_batch_size=32)
+        assert dm.batch_size == 32
+
+    def test_batch_size_writes_train_batch_size(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), train_batch_size=16)
+        dm.batch_size = 64
+        assert dm.train_batch_size == 64
+        assert dm.batch_size == 64
+
+
+class TestDataModuleValBatchSize:
+    """Tests for the val_batch_size lazy resolution."""
+
+    def test_defaults_to_train_batch_size(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), train_batch_size=32)
+        assert dm.val_batch_size == 32
+
+    def test_explicit_value_overrides(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), train_batch_size=32, val_batch_size=4)
+        assert dm.val_batch_size == 4
+
+    def test_tracks_auto_scaled_batch_size(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        # auto_scale_batch_size mutates train_batch_size at fit time via the
+        # `batch_size` setter; an unset val_batch_size must follow.
+        dm = DataModule(train_dataset=dummy_dataset(), train_batch_size=16)
+        dm.batch_size = 128
+        assert dm.val_batch_size == 128
+
+    def test_explicit_value_ignores_auto_scaling(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), train_batch_size=16, val_batch_size=4)
+        dm.batch_size = 128
+        assert dm.val_batch_size == 4
+
+
+class TestDataModuleValidation:
+    """Tests for DataModule validation functionality."""
+
+    def test_collate_gym(self):
+        from physicalai.data.datamodules import _collate_gym
+        from physicalai.gyms import Gym, PushTGym
+
+        gym = PushTGym()
+        batch = [gym]
+
+        result = _collate_gym(batch)
+
+        assert isinstance(result, Gym)
+        assert result is gym
+
+    def test_val_dataloader_structure(self, dummy_datamodule):
+        from physicalai.gyms import Gym
+
+        dummy_datamodule.setup(stage="fit")
+        val_loader = dummy_datamodule.val_dataloader()
+
+        assert len(val_loader) == 2
+
+        batch = next(iter(val_loader))
+
+        assert isinstance(batch, Gym)
+
+
+class TestDataModuleTrainDataloader:
+    """Tests for DataModule.train_dataloader num_workers."""
+
+    def test_train_dataloader_uses_configured_num_workers(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), num_workers=3)
+        dl = dm.train_dataloader()
+        assert dl.num_workers == 3
+
+
+class TestDataModulePinMemory:
+    """Tests for the DataModule pin_memory parameter."""
+
+    def test_auto_resolves_to_accelerator_availability(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset())
+        with patch("physicalai.data.datamodules.torch.accelerator.is_available", return_value=True):
+            assert dm.pin_memory is True
+        with patch("physicalai.data.datamodules.torch.accelerator.is_available", return_value=False):
+            assert dm.pin_memory is False
+
+    def test_auto_is_resolved_lazily(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        # No accelerator probing should happen at construction time.
+        with patch("physicalai.data.datamodules.torch.accelerator.is_available") as mock:
+            DataModule(train_dataset=dummy_dataset())
+            mock.assert_not_called()
+
+    def test_explicit_true(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), pin_memory=True)
+        with patch("physicalai.data.datamodules.torch.accelerator.is_available", return_value=False):
+            assert dm.pin_memory is True
+
+    def test_explicit_false(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), pin_memory=False)
+        with patch("physicalai.data.datamodules.torch.accelerator.is_available", return_value=True):
+            assert dm.pin_memory is False
+
+    def test_train_dataloader_uses_pin_memory(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), pin_memory=False)
+        dl = dm.train_dataloader()
+        assert dl.pin_memory is False
+
+    def test_val_dataloader_uses_pin_memory(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), val_eval_dataset=dummy_dataset(), pin_memory=False)
+        dm.setup(stage="fit")
+        dl = dm.val_dataloader()
+        assert dl.pin_memory is False
+
+
+class TestDataModulePersistentWorkers:
+    """Tests for the DataModule persistent_workers / val_persistent_workers parameters."""
+
+    def test_train_defaults_to_true_when_workers_positive(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), num_workers=2)
+        assert dm.persistent_workers is True
+
+    def test_val_defaults_to_false(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), num_workers=2)
+        assert dm.val_persistent_workers is False
+
+    def test_forced_false_when_no_workers(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), num_workers=0, val_persistent_workers=True)
+        assert dm.persistent_workers is False
+        assert dm.val_persistent_workers is False
+
+    def test_train_explicit_false(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), num_workers=2, persistent_workers=False)
+        assert dm.persistent_workers is False
+
+    def test_val_explicit_true(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), num_workers=2, val_persistent_workers=True)
+        assert dm.val_persistent_workers is True
+
+    def test_train_dataloader_uses_persistent_workers(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), num_workers=2)
+        dl = dm.train_dataloader()
+        assert dl.persistent_workers is True
+
+    def test_val_dataloader_uses_val_persistent_workers(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(train_dataset=dummy_dataset(), val_eval_dataset=dummy_dataset(), num_workers=2)
+        dm.setup(stage="fit")
+        dl = dm.val_dataloader()
+        assert dl.persistent_workers is False
+
+    def test_val_dataloader_honors_explicit_val_persistent_workers(self, dummy_dataset):
+        from physicalai.data import DataModule
+
+        dm = DataModule(
+            train_dataset=dummy_dataset(),
+            val_eval_dataset=dummy_dataset(),
+            num_workers=2,
+            val_persistent_workers=True,
+        )
+        dm.setup(stage="fit")
+        dl = dm.val_dataloader()
+        assert dl.persistent_workers is True
+
+
+class TestDataModuleLogging:
+    """Tests for DataModule num_workers logging."""
+
+    def test_logs_auto_num_workers(self, dummy_dataset, caplog):
+        import logging
+
+        from physicalai.data import DataModule
+
+        with caplog.at_level(logging.INFO, logger="physicalai.data.datamodules"):
+            with patch("physicalai.data.datamodules.resolve_auto_num_workers", return_value=6):
+                DataModule(train_dataset=dummy_dataset())
+
+        assert "DataLoader workers: 6 (auto)" in caplog.text
+
+    def test_logs_explicit_num_workers(self, dummy_dataset, caplog):
+        import logging
+
+        from physicalai.data import DataModule
+
+        with caplog.at_level(logging.INFO, logger="physicalai.data.datamodules"):
+            DataModule(train_dataset=dummy_dataset(), num_workers=2)
+
+        assert "DataLoader workers: 2" in caplog.text
+        assert "(auto)" not in caplog.text

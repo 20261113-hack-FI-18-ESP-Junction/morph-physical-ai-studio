@@ -1,0 +1,2000 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+"""Unit tests for Pi05 policy.
+
+Fast, self-contained tests with no external dependencies (no HuggingFace model downloads).
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from physicalai.config import Config
+from physicalai.data.observation import IMAGES, STATE
+from physicalai.policies.pi05 import Pi05, Pi05Config, Pi05Model
+from physicalai.policies.pi05.pretrained_utils import (
+    fix_state_dict_keys,
+    parse_config_features,
+    resolve_feature_shape,
+)
+
+
+# ============================================================================ #
+# Configuration Tests                                                          #
+# ============================================================================ #
+
+
+class TestPi05Config:
+    """Tests for Pi05Config dataclass."""
+
+    def test_default_config(self) -> None:
+        """Test default configuration values."""
+        config = Pi05Config()
+        assert config.paligemma_variant == "gemma_2b"
+        assert config.action_expert_variant == "gemma_300m"
+        assert config.dtype == "bfloat16"
+        assert config.n_obs_steps == 1
+        assert config.chunk_size == 50
+        assert config.n_action_steps == 50
+
+    def test_custom_config(self) -> None:
+        """Test custom configuration values."""
+        config = Pi05Config(
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_2b",
+            chunk_size=100,
+            n_action_steps=50,
+            optimizer_lr=1e-4,
+            freeze_vision_encoder=True,
+            train_expert_only=True,
+        )
+        assert config.paligemma_variant == "gemma_2b"
+        assert config.action_expert_variant == "gemma_2b"
+        assert config.chunk_size == 100
+        assert config.n_action_steps == 50
+        assert config.optimizer_lr == 1e-4
+        assert config.freeze_vision_encoder is True
+        assert config.train_expert_only is True
+
+    def test_training_config_values(self) -> None:
+        """Test training-related configuration values."""
+        config = Pi05Config()
+        assert config.optimizer_betas == (0.9, 0.95)
+        assert config.optimizer_eps == 1e-8
+        assert config.optimizer_weight_decay == 0.01
+        assert config.optimizer_grad_clip_norm == 1.0
+        assert config.scheduler_warmup_steps == 1_000
+        assert config.scheduler_decay_steps is None
+        assert config.scheduler_decay_lr == 2.5e-6
+
+    def test_flow_matching_config_values(self) -> None:
+        """Test flow matching configuration values."""
+        config = Pi05Config()
+        assert config.num_inference_steps == 10
+        assert config.time_sampling_beta_alpha == 1.5
+        assert config.time_sampling_beta_beta == 1.0
+        assert config.time_sampling_scale == 0.999
+        assert config.time_sampling_offset == 0.001
+        assert config.min_period == 4e-3
+        assert config.max_period == 4.0
+
+    def test_image_config_values(self) -> None:
+        """Test image-related configuration values."""
+        config = Pi05Config()
+        assert config.image_resolution == (224, 224)
+        assert config.empty_cameras == 0
+        assert config.tokenizer_max_length == 200
+
+    def test_n_action_steps_validation(self) -> None:
+        """Test n_action_steps cannot exceed chunk_size."""
+        with pytest.raises(ValueError, match="n_action_steps"):
+            Pi05Config(chunk_size=50, n_action_steps=100)
+
+    def test_paligemma_variant_validation(self) -> None:
+        """Test paligemma_variant must be valid."""
+        with pytest.raises(ValueError, match="Invalid paligemma_variant"):
+            Pi05Config(paligemma_variant="invalid")
+
+    def test_action_expert_variant_validation(self) -> None:
+        """Test action_expert_variant must be valid."""
+        with pytest.raises(ValueError, match="Invalid action_expert_variant"):
+            Pi05Config(action_expert_variant="invalid")
+
+    def test_dtype_validation(self) -> None:
+        """Test dtype must be valid."""
+        with pytest.raises(ValueError, match="Invalid dtype"):
+            Pi05Config(dtype="float16")
+
+    def test_valid_paligemma_variants(self) -> None:
+        """Test valid paligemma variants are accepted."""
+        for variant in ("gemma_300m", "gemma_2b"):
+            config = Pi05Config(paligemma_variant=variant)
+            assert config.paligemma_variant == variant
+
+    def test_valid_action_expert_variants(self) -> None:
+        """Test valid action expert variants are accepted."""
+        for variant in ("gemma_300m", "gemma_2b"):
+            config = Pi05Config(action_expert_variant=variant)
+            assert config.action_expert_variant == variant
+
+    def test_valid_dtypes(self) -> None:
+        """Test valid dtypes are accepted."""
+        for dtype in ("bfloat16", "float32"):
+            config = Pi05Config(dtype=dtype)
+            assert config.dtype == dtype
+
+    def test_inheritance_and_serialization(self) -> None:
+        """Test config inherits from base Config and supports serialization."""
+        config = Pi05Config(chunk_size=100, optimizer_lr=1e-4)
+        assert isinstance(config, Config)
+
+        config_dict = config.to_dict()
+        assert config_dict["chunk_size"] == 100
+        assert config_dict["optimizer_lr"] == 1e-4
+
+        restored = Pi05Config.from_dict(config_dict)
+        assert restored.chunk_size == 100
+        assert restored.optimizer_lr == 1e-4
+
+    def test_frozen_dataclass(self) -> None:
+        """Test Pi05Config is frozen (immutable)."""
+        config = Pi05Config()
+        with pytest.raises(AttributeError):
+            config.chunk_size = 100  # type: ignore[misc]
+
+
+# ============================================================================ #
+# Policy Tests                                                                 #
+# ============================================================================ #
+
+
+class TestPi05Policy:
+    """Tests for Pi05 Lightning policy wrapper."""
+
+    def test_lazy_initialization(self) -> None:
+        """Test lazy initialization doesn't create model."""
+        policy = Pi05()
+        assert policy.model is None
+
+    def test_hyperparameters_saved(self) -> None:
+        """Test hyperparameters are saved for checkpoint."""
+        policy = Pi05(
+            chunk_size=100,
+            optimizer_lr=1e-4,
+            freeze_vision_encoder=True,
+        )
+        assert policy.hparams.chunk_size == 100
+        assert policy.hparams.optimizer_lr == 1e-4
+        assert policy.hparams.freeze_vision_encoder is True
+        assert "config" in policy.hparams
+        assert policy.hparams["config"]["chunk_size"] == 100
+
+    def test_config_attribute(self) -> None:
+        """Test Pi05 policy has config attribute."""
+        policy = Pi05(chunk_size=100, optimizer_lr=1e-4)
+
+        assert policy.config is not None
+        assert policy.config.chunk_size == 100
+        assert policy.config.optimizer_lr == 1e-4
+
+    def test_n_action_steps(self) -> None:
+        """Test n_action_steps is correctly set."""
+        policy = Pi05(n_action_steps=25, chunk_size=50)
+        assert policy._n_action_steps == 25
+        assert policy.config.n_action_steps == 25
+
+    def test_dataset_stats_none_by_default(self) -> None:
+        """Test dataset_stats is None when not provided."""
+        policy = Pi05()
+        assert policy._dataset_stats is None
+
+    def test_preprocessor_none_by_default(self) -> None:
+        """Test preprocessors are None before initialization."""
+        policy = Pi05()
+        assert policy._preprocessor is None
+        assert policy._postprocessor is None
+
+    @pytest.mark.parametrize("method", ["forward", "predict_action_chunk"])
+    def test_methods_raise_without_model(self, method: str) -> None:
+        """Test methods raise ValueError if model not initialized."""
+        from physicalai.data import Observation
+
+        policy = Pi05()
+        dummy_obs = Observation(state=torch.randn(1, 10))
+        with pytest.raises(ValueError, match="not initialized"):
+            getattr(policy, method)(dummy_obs)
+
+    def test_eager_initialization_with_stats(self) -> None:
+        """Test eager initialization with dataset_stats creates model."""
+        stats = {
+            "observation.state": {
+                "name": "observation.state",
+                "shape": (8,),
+                "mean": [0.0] * 8,
+                "std": [1.0] * 8,
+                "q01": [-1.0] * 8,
+                "q99": [1.0] * 8,
+            },
+            "action": {
+                "name": "action",
+                "shape": (7,),
+                "mean": [0.0] * 7,
+                "std": [1.0] * 7,
+                "q01": [-1.0] * 7,
+                "q99": [1.0] * 7,
+            },
+        }
+        # Use smallest variants to keep memory usage low in CI (~300M params instead of ~2.6B)
+        policy = Pi05(
+            dataset_stats=stats,
+            paligemma_variant="gemma_300m",
+            action_expert_variant="gemma_300m",
+        )
+        assert policy.model is not None
+        assert isinstance(policy.model, Pi05Model)
+        assert policy._preprocessor is not None
+        assert policy._postprocessor is not None
+
+    def test_config_passed_through(self) -> None:
+        """Test all config parameters are passed through to config object."""
+        policy = Pi05(
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            dtype="float32",
+            num_inference_steps=20,
+            image_resolution=(224, 224),
+            gradient_checkpointing=True,
+        )
+        assert policy.config.paligemma_variant == "gemma_2b"
+        assert policy.config.action_expert_variant == "gemma_300m"
+        assert policy.config.dtype == "float32"
+        assert policy.config.num_inference_steps == 20
+        assert policy.config.image_resolution == (224, 224)
+        assert policy.config.gradient_checkpointing is True
+
+
+class TestPi05ConfigureOptimizersLoraLR:
+    """LoRA/DoRA scales the learning rate via PeftConfigMixin.lora_lr_scale; this is a
+    library concern, not the application's, so it must hold regardless of caller (UI, CLI,
+    or a raw YAML config)."""
+
+    @staticmethod
+    def _policy_with_dummy_param(**kwargs: object) -> Pi05:
+        from unittest.mock import MagicMock
+
+        policy = Pi05(**kwargs)
+        policy.dummy_param = torch.nn.Parameter(torch.randn(3))
+        policy.trainer = MagicMock(estimated_stepping_batches=100_000)
+        return policy
+
+    def test_lr_unscaled_when_lora_disabled(self) -> None:
+        policy = self._policy_with_dummy_param(optimizer_lr=2.5e-5, scheduler_decay_lr=2.5e-6)
+        scheduler = policy.configure_optimizers()["lr_scheduler"]["scheduler"]
+        # base_lrs is the peak LR the optimizer was constructed with, before the scheduler's
+        # own step()-on-init mutates param_groups[0]["lr"] via the warmup/decay lambda.
+        assert scheduler.base_lrs[0] == pytest.approx(2.5e-5)
+        far_future_lr = scheduler.lr_lambdas[0](1_000_000) * scheduler.base_lrs[0]
+        assert far_future_lr == pytest.approx(2.5e-6)
+
+    def test_peak_and_decay_lr_scaled_by_default_multiplier_when_lora_enabled(self) -> None:
+        policy = self._policy_with_dummy_param(optimizer_lr=2.5e-5, scheduler_decay_lr=2.5e-6, lora_enabled=True)
+        scheduler = policy.configure_optimizers()["lr_scheduler"]["scheduler"]
+        assert scheduler.base_lrs[0] == pytest.approx(2.5e-4)
+        far_future_lr = scheduler.lr_lambdas[0](1_000_000) * scheduler.base_lrs[0]
+        assert far_future_lr == pytest.approx(2.5e-5)
+
+    def test_lr_scaled_by_explicit_lora_lr_scale(self) -> None:
+        policy = self._policy_with_dummy_param(
+            optimizer_lr=2.5e-5, scheduler_decay_lr=2.5e-6, lora_enabled=True, lora_lr_scale=4.0
+        )
+        scheduler = policy.configure_optimizers()["lr_scheduler"]["scheduler"]
+        assert scheduler.base_lrs[0] == pytest.approx(1e-4)
+
+    def test_lr_scaling_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+
+        policy = self._policy_with_dummy_param(optimizer_lr=2.5e-5, lora_enabled=True)
+        with caplog.at_level(logging.INFO):
+            policy.configure_optimizers()
+        assert "scaling optimizer_lr" in caplog.text.lower()
+
+    def test_no_scaling_log_when_lora_disabled(self, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+
+        policy = self._policy_with_dummy_param(optimizer_lr=2.5e-5)
+        with caplog.at_level(logging.INFO):
+            policy.configure_optimizers()
+        assert "scaling optimizer_lr" not in caplog.text.lower()
+
+
+# ============================================================================ #
+# Model Utility Tests                                                          #
+# ============================================================================ #
+
+
+class TestModelUtilities:
+    """Tests for Pi05 model utility functions."""
+
+    def test_pad_vector_shorter(self) -> None:
+        """Test pad_vector pads shorter vectors."""
+        from physicalai.policies.pi05.preprocessor import _pad_vector
+
+        v = torch.randn(2, 7)
+        padded = _pad_vector(v, 32)
+        assert padded.shape == (2, 32)
+        torch.testing.assert_close(padded[:, :7], v)
+        assert (padded[:, 7:] == 0).all()
+
+    def test_pad_vector_equal(self) -> None:
+        """Test pad_vector with equal dimensions (no-op)."""
+        from physicalai.policies.pi05.preprocessor import _pad_vector
+
+        v = torch.randn(2, 32)
+        padded = _pad_vector(v, 32)
+        assert padded.shape == (2, 32)
+        torch.testing.assert_close(padded, v)
+
+    def test_pad_vector_longer(self) -> None:
+        """Test pad_vector with longer vector (no-op)."""
+        from physicalai.policies.pi05.preprocessor import _pad_vector
+
+        v = torch.randn(2, 64)
+        padded = _pad_vector(v, 32)
+        assert padded.shape == (2, 64)
+
+    def test_resize_with_pad_shape(self) -> None:
+        """Test resize_with_pad produces correct output shape."""
+        from physicalai.policies.pi05.preprocessor import _resize_with_pad_torch
+
+        img = torch.rand(2, 480, 640, 3)  # [B, H, W, C]
+        result = _resize_with_pad_torch(img, 224, 224)
+        assert result.shape == (2, 224, 224, 3)
+
+    def test_resize_with_pad_channels_first(self) -> None:
+        """Test resize_with_pad with channels-first format."""
+        from physicalai.policies.pi05.preprocessor import _resize_with_pad_torch
+
+        img = torch.rand(2, 3, 480, 640)  # [B, C, H, W]
+        result = _resize_with_pad_torch(img, 224, 224)
+        assert result.shape == (2, 3, 224, 224)
+
+    def test_resize_with_pad_3d(self) -> None:
+        """Test resize_with_pad with 3D input (no batch dim)."""
+        from physicalai.policies.pi05.preprocessor import _resize_with_pad_torch
+
+        img = torch.rand(480, 640, 3)  # [H, W, C]
+        result = _resize_with_pad_torch(img, 224, 224)
+        assert result.shape == (1, 224, 224, 3)
+
+    def test_resize_with_pad_uint8(self) -> None:
+        """Test resize_with_pad with uint8 images."""
+        from physicalai.policies.pi05.preprocessor import _resize_with_pad_torch
+
+        img = torch.randint(0, 256, (2, 480, 640, 3), dtype=torch.uint8)
+        result = _resize_with_pad_torch(img, 224, 224)
+        assert result.dtype == torch.uint8
+        assert result.shape == (2, 224, 224, 3)
+
+    def test_preprocess_images_pops_source_keys(self) -> None:
+        """Test _preprocess_images removes original image keys from batch."""
+        from physicalai.policies.pi05.preprocessor import Pi05Preprocessor
+
+        prep = Pi05Preprocessor(image_resolution=(64, 64))
+        batch = {
+            STATE: torch.randn(1, 4),
+            f"{IMAGES}.0": torch.rand(1, 3, 48, 48),
+            f"{IMAGES}.1": torch.rand(1, 3, 32, 64),
+        }
+        images, masks = prep._preprocess_images(batch)
+
+        assert f"{IMAGES}.0" not in batch
+        assert f"{IMAGES}.1" not in batch
+        assert len(images) == 2
+        assert len(masks) == 2
+
+    def test_resize_with_pad_unsupported_dtype(self) -> None:
+        """Test resize_with_pad raises error for unsupported dtype."""
+        from physicalai.policies.pi05.preprocessor import _resize_with_pad_torch
+
+        img = torch.rand(2, 480, 640, 3).to(torch.float16)
+        with pytest.raises(ValueError, match="Unsupported image dtype"):
+            _resize_with_pad_torch(img, 224, 224)
+
+    def test_create_sinusoidal_pos_embedding_shape(self) -> None:
+        """Test sinusoidal positional embedding has correct shape."""
+        from physicalai.policies.pi05.model import _create_sinusoidal_pos_embedding
+
+        time = torch.tensor([0.1, 0.5, 0.9])
+        emb = _create_sinusoidal_pos_embedding(time, 64, min_period=4e-3, max_period=4.0, device=time.device)
+        assert emb.shape == (3, 64)
+
+    def test_create_sinusoidal_pos_embedding_odd_dim(self) -> None:
+        """Test sinusoidal embedding raises for odd dimension."""
+        from physicalai.policies.pi05.model import _create_sinusoidal_pos_embedding
+
+        time = torch.tensor([0.5])
+        with pytest.raises(ValueError, match="divisible by 2"):
+            _create_sinusoidal_pos_embedding(time, 65, min_period=4e-3, max_period=4.0, device=time.device)
+
+    def test_create_sinusoidal_pos_embedding_wrong_ndim(self) -> None:
+        """Test sinusoidal embedding raises for wrong ndim."""
+        from physicalai.policies.pi05.model import _create_sinusoidal_pos_embedding
+
+        time = torch.tensor([[0.5]])  # 2D instead of 1D
+        with pytest.raises(ValueError, match="batch_size"):
+            _create_sinusoidal_pos_embedding(time, 64, min_period=4e-3, max_period=4.0, device=time.device)
+
+    def test_sample_beta(self) -> None:
+        """Test sample_beta returns correct shape."""
+        from physicalai.policies.pi05.model import _sample_beta
+
+        result = _sample_beta(1.5, 1.0, 4, torch.device("cpu"))
+        assert result.shape == (4,)
+        assert (result >= 0).all() and (result <= 1).all()
+
+    def test_make_att_2d_masks_shape(self) -> None:
+        """Test make_att_2d_masks returns correct shape."""
+        from physicalai.policies.pi05.model import _make_att_2d_masks
+
+        pad_masks = torch.ones(2, 10, dtype=torch.bool)
+        att_masks = torch.zeros(2, 10, dtype=torch.bool)
+        result = _make_att_2d_masks(pad_masks, att_masks)
+        assert result.shape == (2, 10, 10)
+        assert result.dtype == torch.bool
+
+    def test_make_att_2d_masks_wrong_ndim(self) -> None:
+        """Test make_att_2d_masks raises for wrong ndim."""
+        from physicalai.policies.pi05.model import _make_att_2d_masks
+
+        pad_masks = torch.ones(2, 3, 10, dtype=torch.bool)  # 3D
+        att_masks = torch.zeros(2, 10, dtype=torch.bool)
+        with pytest.raises(ValueError, match="2D"):
+            _make_att_2d_masks(pad_masks, att_masks)
+
+    def test_get_gemma_config_300m(self) -> None:
+        """Test get_gemma_config for gemma_300m variant."""
+        from physicalai.policies.pi05.model import get_gemma_config
+
+        config = get_gemma_config("gemma_300m")
+        assert config.width == 1024
+        assert config.depth == 18
+        assert config.mlp_dim == 4096
+        assert config.num_heads == 8
+        assert config.num_kv_heads == 1
+        assert config.head_dim == 256
+
+    def test_get_gemma_config_2b(self) -> None:
+        """Test get_gemma_config for gemma_2b variant."""
+        from physicalai.policies.pi05.model import get_gemma_config
+
+        config = get_gemma_config("gemma_2b")
+        assert config.width == 2048
+        assert config.depth == 18
+        assert config.mlp_dim == 16_384
+
+    def test_get_gemma_config_unknown(self) -> None:
+        """Test get_gemma_config raises for unknown variant."""
+        from physicalai.policies.pi05.model import get_gemma_config
+
+        with pytest.raises(ValueError, match="Unknown variant"):
+            get_gemma_config("gemma_7b")
+
+    def test_get_safe_dtype_cpu(self) -> None:
+        """Test get_safe_dtype returns float32 for bfloat16 on CPU."""
+        from physicalai.policies.pi05.model import _get_safe_dtype
+
+        assert _get_safe_dtype(torch.bfloat16, "cpu") == torch.float32
+        assert _get_safe_dtype(torch.float64, "cpu") == torch.float64
+        assert _get_safe_dtype(torch.float32, "cpu") == torch.float32
+
+    def test_get_safe_dtype_cuda(self) -> None:
+        """Test get_safe_dtype returns target dtype for CUDA."""
+        from physicalai.policies.pi05.model import _get_safe_dtype
+
+        assert _get_safe_dtype(torch.bfloat16, "cuda") == torch.bfloat16
+        assert _get_safe_dtype(torch.float32, "cuda") == torch.float32
+
+
+# ============================================================================ #
+# Pi Gemma Component Tests                                                     #
+# ============================================================================ #
+
+
+class TestPiGemmaComponents:
+    """Tests for PiGemma model components."""
+
+    def test_gated_residual_both_none(self) -> None:
+        """Test gated_residual with both inputs None."""
+        from physicalai.policies.pi05.pi_gemma import _gated_residual
+
+        result = _gated_residual(None, None, None)
+        assert result is None
+
+    def test_gated_residual_x_none(self) -> None:
+        """Test gated_residual with x None."""
+        from physicalai.policies.pi05.pi_gemma import _gated_residual
+
+        y = torch.randn(2, 3)
+        result = _gated_residual(None, y, None)
+        torch.testing.assert_close(result, y)
+
+    def test_gated_residual_y_none(self) -> None:
+        """Test gated_residual with y None."""
+        from physicalai.policies.pi05.pi_gemma import _gated_residual
+
+        x = torch.randn(2, 3)
+        result = _gated_residual(x, None, None)
+        torch.testing.assert_close(result, x)
+
+    def test_gated_residual_no_gate(self) -> None:
+        """Test gated_residual without gate (simple addition)."""
+        from physicalai.policies.pi05.pi_gemma import _gated_residual
+
+        x = torch.randn(2, 3)
+        y = torch.randn(2, 3)
+        result = _gated_residual(x, y, None)
+        torch.testing.assert_close(result, x + y)
+
+    def test_gated_residual_with_gate(self) -> None:
+        """Test gated_residual with gate modulation."""
+        from physicalai.policies.pi05.pi_gemma import _gated_residual
+
+        x = torch.randn(2, 3)
+        y = torch.randn(2, 3)
+        gate = torch.randn(2, 3)
+        result = _gated_residual(x, y, gate)
+        torch.testing.assert_close(result, x + y * gate)
+
+    def test_pi_gemma_rms_norm_standard(self) -> None:
+        """Test PiGemmaRMSNorm without conditioning (standard mode)."""
+        from physicalai.policies.pi05.pi_gemma import PiGemmaRMSNorm
+
+        norm = PiGemmaRMSNorm(dim=16)
+        x = torch.randn(2, 10, 16)
+        output, gate = norm(x)
+        assert output.shape == x.shape
+        assert gate is None
+
+    def test_pi_gemma_rms_norm_adaptive(self) -> None:
+        """Test PiGemmaRMSNorm with adaptive conditioning (AdaRMS)."""
+        from physicalai.policies.pi05.pi_gemma import PiGemmaRMSNorm
+
+        norm = PiGemmaRMSNorm(dim=16, cond_dim=32)
+        x = torch.randn(2, 10, 16)
+        cond = torch.randn(2, 32)
+        output, gate = norm(x, cond=cond)
+        assert output.shape == x.shape
+        assert gate is not None
+        assert gate.shape == (2, 1, 16)  # Unsqueezed for 3D input
+
+    def test_pi_gemma_rms_norm_cond_dim_mismatch(self) -> None:
+        """Test PiGemmaRMSNorm raises for wrong cond dimension."""
+        from physicalai.policies.pi05.pi_gemma import PiGemmaRMSNorm
+
+        norm = PiGemmaRMSNorm(dim=16, cond_dim=32)
+        x = torch.randn(2, 10, 16)
+        cond = torch.randn(2, 64)  # Wrong dim (expected 32)
+        with pytest.raises(ValueError, match="Expected cond dim"):
+            norm(x, cond=cond)
+
+    def test_pi_gemma_rms_norm_extra_repr(self) -> None:
+        """Test PiGemmaRMSNorm extra_repr for both modes."""
+        from physicalai.policies.pi05.pi_gemma import PiGemmaRMSNorm
+
+        standard_norm = PiGemmaRMSNorm(dim=16)
+        assert "adaptive" not in standard_norm.extra_repr()
+
+        adaptive_norm = PiGemmaRMSNorm(dim=16, cond_dim=32)
+        assert "adaptive=True" in adaptive_norm.extra_repr()
+        assert "cond_dim=32" in adaptive_norm.extra_repr()
+
+    def test_layernorm_forward_without_cond(self) -> None:
+        """Test layernorm_forward without conditioning."""
+        from physicalai.policies.pi05.pi_gemma import PiGemmaRMSNorm, layernorm_forward
+
+        norm = PiGemmaRMSNorm(dim=16)
+        x = torch.randn(2, 10, 16)
+        output, gate = layernorm_forward(norm, x, cond=None)
+        assert output.shape == x.shape
+        assert gate is None
+
+    def test_layernorm_forward_with_cond(self) -> None:
+        """Test layernorm_forward with conditioning."""
+        from physicalai.policies.pi05.pi_gemma import PiGemmaRMSNorm, layernorm_forward
+
+        norm = PiGemmaRMSNorm(dim=16, cond_dim=32)
+        x = torch.randn(2, 10, 16)
+        cond = torch.randn(2, 32)
+        output, gate = layernorm_forward(norm, x, cond=cond)
+        assert output.shape == x.shape
+        assert gate is not None
+
+
+# ============================================================================ #
+# Preprocessor Tests                                                           #
+# ============================================================================ #
+
+
+class TestPi05Preprocessor:
+    """Tests for Pi05 preprocessor functions."""
+
+    def test_make_pi05_preprocessors(self) -> None:
+        """Test make_pi05_preprocessors returns callables."""
+        from physicalai.policies.pi05.preprocessor import make_pi05_preprocessors
+
+        preprocessor, postprocessor = make_pi05_preprocessors(
+            max_action_dim=32,
+            stats=None,
+            image_resolution=(224, 224),
+            max_token_len=200,
+        )
+        assert callable(preprocessor)
+        assert callable(postprocessor)
+
+    def test_preprocessor_is_nn_module(self) -> None:
+        """Test that preprocessors are nn.Module instances."""
+        from physicalai.policies.pi05.preprocessor import Pi05Postprocessor, Pi05Preprocessor
+
+        preprocessor = Pi05Preprocessor()
+        postprocessor = Pi05Postprocessor()
+
+        assert isinstance(preprocessor, torch.nn.Module)
+        assert isinstance(postprocessor, torch.nn.Module)
+
+    def test_preprocessor_default_values(self) -> None:
+        """Test preprocessor default configuration values."""
+        from physicalai.policies.pi05.preprocessor import Pi05Preprocessor
+
+        preprocessor = Pi05Preprocessor()
+
+        assert preprocessor.max_action_dim == 32
+        assert preprocessor.image_resolution == (224, 224)
+        assert preprocessor.max_token_len == 200
+        assert preprocessor.tokenizer_name == "google/paligemma-3b-pt-224"
+        assert preprocessor.empty_cameras == 0
+
+    def test_preprocessor_custom_values(self) -> None:
+        """Test preprocessor with custom configuration values."""
+        from physicalai.policies.pi05.preprocessor import Pi05Preprocessor
+
+        preprocessor = Pi05Preprocessor(
+            max_action_dim=16,
+            image_resolution=(512, 512),
+            max_token_len=300,
+            empty_cameras=2,
+        )
+
+        assert preprocessor.max_action_dim == 16
+        assert preprocessor.image_resolution == (512, 512)
+        assert preprocessor.max_token_len == 300
+        assert preprocessor.empty_cameras == 2
+
+    def test_postprocessor_identity_without_features(self) -> None:
+        """Test postprocessor acts as identity without features."""
+        from physicalai.data.observation import ACTION
+        from physicalai.policies.pi05.preprocessor import Pi05Postprocessor
+
+        postprocessor = Pi05Postprocessor(features=None)
+        action = torch.randn(2, 50, 7)
+        batch = {ACTION: action}
+
+        result = postprocessor(batch)
+        torch.testing.assert_close(result[ACTION], action)
+
+    def test_postprocessor_without_action_key(self) -> None:
+        """Test postprocessor handles missing action key gracefully."""
+        from physicalai.policies.pi05.preprocessor import Pi05Postprocessor
+
+        postprocessor = Pi05Postprocessor(features=None)
+        batch = {"other_key": torch.randn(2, 10)}
+        result = postprocessor(batch)
+        assert "other_key" in result
+
+    def test_make_preprocessors_with_stats(self) -> None:
+        """Test make_pi05_preprocessors with dataset statistics."""
+        from physicalai.policies.pi05.preprocessor import make_pi05_preprocessors
+
+        stats: dict[str, dict] = {
+            "observation.state": {
+                "name": "observation.state",
+                "shape": (8,),
+                "mean": [0.0] * 8,
+                "std": [1.0] * 8,
+                "q01": [-1.0] * 8,
+                "q99": [1.0] * 8,
+            },
+            "action": {
+                "name": "action",
+                "shape": (7,),
+                "mean": [0.0] * 7,
+                "std": [1.0] * 7,
+                "q01": [-1.0] * 7,
+                "q99": [1.0] * 7,
+            },
+        }
+
+        preprocessor, postprocessor = make_pi05_preprocessors(
+            max_action_dim=32,
+            stats=stats,
+            image_resolution=(224, 224),
+            max_token_len=200,
+        )
+
+        assert preprocessor is not None
+        assert postprocessor is not None
+
+    def test_make_preprocessors_maps_observation_prefix(self) -> None:
+        """Test that make_pi05_preprocessors strips 'observation.' prefix from names."""
+        from physicalai.policies.pi05.preprocessor import make_pi05_preprocessors
+
+        stats = {
+            "observation.state": {
+                "name": "observation.state",
+                "shape": (8,),
+                "mean": [0.0] * 8,
+                "std": [1.0] * 8,
+                "q01": [-1.0] * 8,
+                "q99": [1.0] * 8,
+            },
+        }
+
+        preprocessor, _ = make_pi05_preprocessors(stats=stats)
+        # The normalizer should have "state" mapped (not "observation.state")
+        assert hasattr(preprocessor, "_state_action_normalizer")
+
+
+# ============================================================================ #
+# Feature Normalization Tests                                                  #
+# ============================================================================ #
+
+
+class TestFeatureNormalization:
+    """Tests for feature normalization in Pi05 preprocessor."""
+
+    def test_preprocessor_with_features(self) -> None:
+        """Test preprocessor with feature configuration."""
+        from physicalai.data import Feature, FeatureType, NormalizationParameters
+        from physicalai.policies.pi05.preprocessor import Pi05Preprocessor
+
+        features = {
+            "state": Feature(
+                name="state",
+                ftype=FeatureType.STATE,
+                shape=(8,),
+                normalization_data=NormalizationParameters(
+                    mean=[0.0] * 8,
+                    std=[1.0] * 8,
+                    q01=[-1.0] * 8,
+                    q99=[1.0] * 8,
+                ),
+            ),
+        }
+        preprocessor = Pi05Preprocessor(features=features)
+        assert preprocessor._state_action_normalizer is not None
+
+    def test_postprocessor_with_features(self) -> None:
+        """Test postprocessor with feature configuration."""
+        from physicalai.data import Feature, FeatureType, NormalizationParameters
+        from physicalai.policies.pi05.preprocessor import Pi05Postprocessor
+
+        features = {
+            "action": Feature(
+                name="action",
+                ftype=FeatureType.ACTION,
+                shape=(7,),
+                normalization_data=NormalizationParameters(
+                    mean=[0.0] * 7,
+                    std=[1.0] * 7,
+                    q01=[-1.0] * 7,
+                    q99=[1.0] * 7,
+                ),
+            ),
+        }
+        postprocessor = Pi05Postprocessor(features=features)
+        assert postprocessor._action_denormalizer is not None
+
+
+# ============================================================================ #
+# Sample Input Tests                                                           #
+# ============================================================================ #
+
+
+class TestSampleInput:
+    """Tests for Pi05.sample_input visual-feature detection.
+
+    Uses a lightweight stub instead of constructing the full model to keep
+    these tests fast and free of HuggingFace downloads.
+    """
+
+    @staticmethod
+    def _call_sample_input(dataset_stats: dict) -> dict:
+        """Invoke the Pi05.sample_input property on a minimal stub."""
+
+        class _ModelStub:
+            def __init__(self) -> None:
+                # sample_input only reads device from this module's parameters.
+                self.paligemma_with_expert = torch.nn.Linear(1, 1)
+
+        class _Stub:
+            def __init__(self, stats: dict) -> None:
+                self._dataset_stats = stats
+                self.model = _ModelStub()
+                self.config = Pi05Config()
+                self.rtc_enabled = False
+
+        stub = _Stub(dataset_stats)
+        stub.inputs_schema = Pi05.inputs_schema.fget(stub)  # type: ignore[attr-defined]
+        return Pi05.sample_input.fget(stub)  # type: ignore[attr-defined]
+
+    def test_sample_input_single_visual_feature_with_image_in_id(self) -> None:
+        """Single visual feature whose id contains 'image' produces IMAGES key."""
+        stats = {
+            "observation.state": {"name": "state", "shape": (8,), "type": "STATE"},
+            "observation.image": {"name": "image", "shape": (3, 224, 224), "type": "VISUAL"},
+        }
+        sample_input = self._call_sample_input(stats)
+        assert STATE in sample_input
+        assert IMAGES in sample_input
+        assert sample_input[STATE].shape == (1, 8)
+        assert sample_input[IMAGES].shape == (1, 3, 224, 224)
+
+    def test_sample_input_single_visual_feature_without_image_in_id(self) -> None:
+        """Visual feature without 'image' in id is still detected via the 'type' field."""
+        stats = {
+            "observation.state": {"name": "state", "shape": (8,), "type": "STATE"},
+            "observation.front_cam": {
+                "name": "front_cam",
+                "shape": (3, 224, 224),
+                "type": "VISUAL",
+            },
+        }
+        sample_input = self._call_sample_input(stats)
+        assert STATE in sample_input
+        assert IMAGES in sample_input
+        assert sample_input[IMAGES].shape == (1, 3, 224, 224)
+
+    def test_sample_input_multiple_visual_features_without_image_in_id(self) -> None:
+        """Multiple visual features without 'image' in id produce per-feature IMAGES.<name> keys."""
+        stats = {
+            "observation.state": {"name": "state", "shape": (8,), "type": "STATE"},
+            "observation.front_cam": {
+                "name": "front_cam",
+                "shape": (3, 224, 224),
+                "type": "VISUAL",
+            },
+            "observation.wrist_cam": {
+                "name": "wrist_cam",
+                "shape": (3, 224, 224),
+                "type": "VISUAL",
+            },
+        }
+        sample_input = self._call_sample_input(stats)
+        assert STATE in sample_input
+        assert f"{IMAGES}.front_cam" in sample_input
+        assert f"{IMAGES}.wrist_cam" in sample_input
+        assert IMAGES not in sample_input
+
+
+# ============================================================================ #
+# Policy Static Method Tests                                                   #
+# ============================================================================ #
+
+
+class TestPretrainedUtils:
+    """Tests for pretrained_utils helper functions."""
+
+    def test_fix_state_dict_keys_strips_model_prefix(self) -> None:
+        """Test _fix_state_dict_keys strips 'model.' prefix."""
+        original = {"model.some_layer.weight": torch.randn(3, 3)}
+        fixed = fix_state_dict_keys(original)
+        assert "some_layer.weight" in fixed
+        assert "model.some_layer.weight" not in fixed
+
+    def test_fix_state_dict_keys_renames_action_time_mlp(self) -> None:
+        """Test _fix_state_dict_keys renames action_time_mlp to time_mlp."""
+        original = {
+            "action_time_mlp_in.weight": torch.randn(3, 3),
+            "action_time_mlp_out.bias": torch.randn(3),
+        }
+        fixed = fix_state_dict_keys(original)
+        assert "time_mlp_in.weight" in fixed
+        assert "time_mlp_out.bias" in fixed
+
+    def test_fix_state_dict_keys_skips_state_proj(self) -> None:
+        """Test _fix_state_dict_keys skips state_proj keys."""
+        original = {"state_proj.weight": torch.randn(3, 3)}
+        fixed = fix_state_dict_keys(original)
+        assert "state_proj.weight" not in fixed
+
+    def test_fix_state_dict_keys_skips_expert_layernorm(self) -> None:
+        """Test _fix_state_dict_keys skips expert layernorm weight keys."""
+        original = {
+            "paligemma_with_expert.gemma_expert.model.layers.0.input_layernorm.weight": torch.randn(16),
+            "paligemma_with_expert.gemma_expert.model.layers.0.post_attention_layernorm.weight": torch.randn(16),
+            "paligemma_with_expert.gemma_expert.model.norm.weight": torch.randn(16),
+        }
+        fixed = fix_state_dict_keys(original)
+        for key in original:
+            assert key not in fixed
+
+    def test_fix_state_dict_keys_copies_lm_head(self) -> None:
+        """Test _fix_state_dict_keys copies lm_head to embed_tokens."""
+        weight = torch.randn(100, 2048)
+        original = {
+            "model.paligemma_with_expert.paligemma.lm_head.weight": weight,
+        }
+        fixed = fix_state_dict_keys(original)
+        tied_key = "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+        assert tied_key in fixed
+        torch.testing.assert_close(fixed[tied_key], weight)
+
+    def test_parse_config_features(self) -> None:
+        """Test _parse_config_features extracts features from config."""
+        hf_config = {
+            "input_features": {
+                "observation.state": {"shape": [8]},
+            },
+            "output_features": {
+                "action": {"shape": [7]},
+            },
+        }
+        stats = parse_config_features(hf_config)
+        assert "observation.state" in stats
+        assert "action" in stats
+        assert stats["observation.state"]["mean"] == [0.0] * 8
+        assert stats["action"]["std"] == [1.0] * 7
+
+    def test_parse_config_features_empty(self) -> None:
+        """Test _parse_config_features with empty config."""
+        stats = parse_config_features({})
+        assert stats == {}
+
+    def test_resolve_feature_shape_from_config(self) -> None:
+        """Test _resolve_feature_shape uses config features."""
+        hf_config = {
+            "input_features": {
+                "observation.state": {"shape": [8]},
+            },
+        }
+        shape = resolve_feature_shape("observation.state", hf_config, {})
+        assert shape == (8,)
+
+    def test_resolve_feature_shape_from_stats(self) -> None:
+        """Test _resolve_feature_shape infers shape from stats."""
+        shape = resolve_feature_shape(
+            "observation.state",
+            {},
+            {"mean": [0.0, 0.0, 0.0]},
+        )
+        assert shape == (3,)
+
+    def test_resolve_feature_shape_fallback(self) -> None:
+        """Test _resolve_feature_shape falls back to (1,)."""
+        shape = resolve_feature_shape("unknown", {}, {})
+        assert shape == (1,)
+
+
+# ============================================================================ #
+# Fine-tuning & Pretrained Path Tests                                          #
+# ============================================================================ #
+
+
+class TestPi05FineTuning:
+    """Tests for Pi05 fine-tuning and pretrained configuration forwarding."""
+
+    def test_gradient_checkpointing_default_true(self) -> None:
+        """Test gradient_checkpointing defaults to True in Pi05 policy."""
+        policy = Pi05()
+        assert policy.config.gradient_checkpointing is True
+
+    def test_gradient_checkpointing_false(self) -> None:
+        """Test gradient_checkpointing can be set to False."""
+        policy = Pi05(gradient_checkpointing=False)
+        assert policy.config.gradient_checkpointing is False
+
+    def test_save_hyperparameters_ignores_pretrained(self) -> None:
+        """Test pretrained_name_or_path is excluded from saved hyperparameters."""
+        policy = Pi05()
+        assert "pretrained_name_or_path" not in policy.hparams
+
+    def test_save_hyperparameters_ignores_compile_model(self) -> None:
+        """Test compile_model is excluded from saved hyperparameters."""
+        policy = Pi05(compile_model=True)
+        assert "compile_model" not in policy.hparams
+
+    def test_update_preprocessor_stats(self) -> None:
+        """Test _update_preprocessor_stats rebuilds preprocessors with new stats."""
+        stats = {
+            "observation.state": {
+                "name": "observation.state",
+                "shape": (8,),
+                "mean": [0.0] * 8,
+                "std": [1.0] * 8,
+                "q01": [-1.0] * 8,
+                "q99": [1.0] * 8,
+            },
+            "action": {
+                "name": "action",
+                "shape": (7,),
+                "mean": [0.0] * 7,
+                "std": [1.0] * 7,
+                "q01": [-1.0] * 7,
+                "q99": [1.0] * 7,
+            },
+        }
+        # Use smallest variants to keep memory usage low
+        policy = Pi05(
+            dataset_stats=stats,
+            paligemma_variant="gemma_300m",
+            action_expert_variant="gemma_300m",
+        )
+        assert policy._preprocessor is not None
+
+        # Now update with different stats
+        new_stats = {
+            "observation.state": {
+                "name": "observation.state",
+                "shape": (4,),
+                "mean": [1.0] * 4,
+                "std": [2.0] * 4,
+                "q01": [-2.0] * 4,
+                "q99": [2.0] * 4,
+            },
+            "action": {
+                "name": "action",
+                "shape": (3,),
+                "mean": [1.0] * 3,
+                "std": [2.0] * 3,
+                "q01": [-2.0] * 3,
+                "q99": [2.0] * 3,
+            },
+        }
+        old_preprocessor = policy._preprocessor
+        policy._update_preprocessor_stats(new_stats)
+
+        assert policy._dataset_stats is new_stats
+        assert policy.hparams["dataset_stats"] is new_stats
+        # Preprocessor should be a new object
+        assert policy._preprocessor is not old_preprocessor
+
+    def test_update_preprocessor_stats_updates_model(self) -> None:
+        """Test _update_preprocessor_stats forwards stats to model."""
+        stats = {
+            "observation.state": {
+                "name": "observation.state",
+                "shape": (8,),
+                "mean": [0.0] * 8,
+                "std": [1.0] * 8,
+                "q01": [-1.0] * 8,
+                "q99": [1.0] * 8,
+            },
+            "action": {
+                "name": "action",
+                "shape": (7,),
+                "mean": [0.0] * 7,
+                "std": [1.0] * 7,
+                "q01": [-1.0] * 7,
+                "q99": [1.0] * 7,
+            },
+        }
+        policy = Pi05(
+            dataset_stats=stats,
+            paligemma_variant="gemma_300m",
+            action_expert_variant="gemma_300m",
+        )
+
+        new_stats = {
+            "observation.state": {
+                "name": "observation.state",
+                "shape": (4,),
+                "mean": [2.0] * 4,
+                "std": [3.0] * 4,
+                "q01": [-3.0] * 4,
+                "q99": [3.0] * 4,
+            },
+            "action": {
+                "name": "action",
+                "shape": (3,),
+                "mean": [2.0] * 3,
+                "std": [3.0] * 3,
+                "q01": [-3.0] * 3,
+                "q99": [3.0] * 3,
+            },
+        }
+        policy._update_preprocessor_stats(new_stats)
+        assert policy.model._dataset_stats is new_stats
+
+    def test_config_with_all_optimizer_params(self) -> None:
+        """Test all optimizer/scheduler params are stored in config."""
+        policy = Pi05(
+            optimizer_lr=1e-3,
+            optimizer_betas=(0.8, 0.99),
+            optimizer_eps=1e-7,
+            optimizer_weight_decay=0.1,
+            optimizer_grad_clip_norm=0.5,
+            scheduler_warmup_steps=500,
+            scheduler_decay_steps=10_000,
+            scheduler_decay_lr=1e-5,
+        )
+        assert policy.config.optimizer_lr == 1e-3
+        assert policy.config.optimizer_betas == (0.8, 0.99)
+        assert policy.config.optimizer_eps == 1e-7
+        assert policy.config.optimizer_weight_decay == 0.1
+        assert policy.config.optimizer_grad_clip_norm == 0.5
+        assert policy.config.scheduler_warmup_steps == 500
+        assert policy.config.scheduler_decay_steps == 10_000
+        assert policy.config.scheduler_decay_lr == 1e-5
+
+
+# ============================================================================ #
+# Export Args Tests                                                            #
+# ============================================================================ #
+
+
+class TestPi05ExtraExportArgs:
+    """Tests for Pi05.extra_export_args preprocessor ordering and contents."""
+
+    @staticmethod
+    def _mock_stats() -> dict[str, dict[str, list[float] | str | tuple]]:
+        return {
+            "observation.state": {
+                "name": "observation.state",
+                "shape": (8,),
+                "mean": [0.0] * 8,
+                "std": [1.0] * 8,
+                "q01": [-1.0] * 8,
+                "q99": [1.0] * 8,
+            },
+            "action": {
+                "name": "action",
+                "shape": (7,),
+                "mean": [0.0] * 7,
+                "std": [1.0] * 7,
+                "q01": [-1.0] * 7,
+                "q99": [1.0] * 7,
+            },
+        }
+
+    def test_raises_without_dataset_stats(self) -> None:
+        """extra_export_args should raise if dataset_stats are unavailable."""
+        policy = Pi05()
+        with pytest.raises(ValueError, match="Dataset stats are required"):
+            _ = policy.extra_export_args
+
+    @pytest.mark.parametrize(("backend", "expected"), [("onnx", [[50, 32]]), ("openvino", [[50, 32]]), ("torch", [])])
+    def test_manifest_draws_the_noise_for_graph_exports(self, backend: str, expected: list) -> None:
+        """Graph exports get the start noise from the runtime; eager torch samples it itself."""
+        policy = Pi05()
+        policy._dataset_stats = self._mock_stats()
+
+        specs = policy.extra_export_args[backend].preprocessors_specs
+        noise = [spec.model_dump() for spec in specs if spec.type == "noise"]
+
+        assert [spec["shape"] for spec in noise] == expected
+
+    def test_zero_start_noise_stays_in_the_graph(self) -> None:
+        """With ``use_random_input_noise=False`` eager inference starts from zeros; exports must too."""
+        from physicalai.data.constants import NOISE
+
+        policy = Pi05(use_random_input_noise=False)
+        policy._dataset_stats = self._mock_stats()
+
+        specs = [spec for args in policy.extra_export_args.values() for spec in args.preprocessors_specs]
+        assert not [spec for spec in specs if spec.type == "noise"]
+        stub = SimpleNamespace(model=object(), _dataset_stats=policy._dataset_stats, config=policy.config, rtc_enabled=False)
+        assert NOISE not in {feature.name for feature in Pi05.inputs_schema.fget(stub)}  # type: ignore[attr-defined]
+
+    def test_preprocessor_order_normalize_before_pi05(self) -> None:
+        """Normalize must run before the pi05 image transform for both onnx and openvino."""
+        policy = Pi05()
+        # Inject mock stats directly to avoid building the heavy model.
+        policy._dataset_stats = self._mock_stats()
+
+        args = policy.extra_export_args
+
+        for backend in ("onnx", "openvino"):
+            specs = args[backend].preprocessors_specs
+            types = [s.type for s in specs]
+            assert types[0] == "normalize", f"{backend}: expected normalize first, got {types}"
+            assert types[1] == "pi05", f"{backend}: expected pi05 second, got {types}"
+            assert types.index("normalize") < types.index("pi05"), (
+                f"{backend}: normalize must precede pi05, got {types}"
+            )
+
+
+# ============================================================================ #
+# embed_prefix Tests                                                           #
+# ============================================================================ #
+
+
+class TestEmbedPrefix:
+    """Tests for Pi05Model.embed_prefix batched/per-camera behavior.
+
+    Uses a lightweight stub that replaces the heavy vision encoder and language
+    embedding with simple linear projections to verify control flow and shapes.
+    """
+
+    @staticmethod
+    def _make_stub_model(
+        hidden_dim: int = 32,
+        num_patches: int = 4,
+        training: bool = False,
+        gradient_checkpointing: bool = False,
+    ) -> Pi05Model:
+        """Create a minimal Pi05Model stub with mocked sub-modules."""
+        from unittest.mock import MagicMock, patch
+
+        # Bypass __init__ to avoid loading the full PaliGemma model
+        with patch.object(Pi05Model, "__init__", lambda self: None):
+            model = Pi05Model.__new__(Pi05Model)
+
+        # Set nn.Module internals manually
+        torch.nn.Module.__init__(model)
+
+        model.training = training
+        model.gradient_checkpointing_enabled = gradient_checkpointing
+
+        # Mock paligemma_with_expert with simple deterministic functions
+        mock_paligemma = MagicMock()
+
+        def _embed_image(imgs: torch.Tensor) -> torch.Tensor:
+            """Fake vision encoder: project flattened patches to hidden_dim."""
+            batch = imgs.shape[0]
+            return torch.randn(batch, num_patches, hidden_dim)
+
+        def _embed_language(tokens: torch.Tensor) -> torch.Tensor:
+            """Fake language embedding."""
+            batch, seq_len = tokens.shape
+            return torch.randn(batch, seq_len, hidden_dim)
+
+        mock_paligemma.embed_image = _embed_image
+        mock_paligemma.embed_language_tokens = _embed_language
+        model.paligemma_with_expert = mock_paligemma
+
+        return model
+
+    def test_output_shapes_eval_mode(self) -> None:
+        """Test embed_prefix returns correct shapes in eval mode (batched path)."""
+        model = self._make_stub_model(hidden_dim=32, num_patches=4, training=False)
+        num_cameras, bsize, c, h, w = 2, 3, 3, 224, 224
+        seq_len = 10
+
+        images = torch.randn(num_cameras, bsize, c, h, w)
+        img_masks = torch.ones(num_cameras, bsize, dtype=torch.bool)
+        tokens = torch.randint(0, 100, (bsize, seq_len))
+        masks = torch.ones(bsize, seq_len, dtype=torch.bool)
+
+        embs, pad_masks, att_masks = model.embed_prefix(images, img_masks, tokens, masks)
+
+        expected_seq = num_cameras * 4 + seq_len  # 4 patches per camera + lang tokens
+        assert embs.shape == (bsize, expected_seq, 32)
+        assert pad_masks.shape == (bsize, expected_seq)
+        assert att_masks.shape == (bsize, expected_seq)
+        assert att_masks.dtype == torch.bool
+
+    def test_output_shapes_train_mode(self) -> None:
+        """Test embed_prefix returns correct shapes in train mode (per-camera path)."""
+        model = self._make_stub_model(hidden_dim=32, num_patches=4, training=True)
+        num_cameras, bsize, c, h, w = 2, 3, 3, 224, 224
+        seq_len = 10
+
+        images = torch.randn(num_cameras, bsize, c, h, w)
+        img_masks = torch.ones(num_cameras, bsize, dtype=torch.bool)
+        tokens = torch.randint(0, 100, (bsize, seq_len))
+        masks = torch.ones(bsize, seq_len, dtype=torch.bool)
+
+        embs, pad_masks, att_masks = model.embed_prefix(images, img_masks, tokens, masks)
+
+        expected_seq = num_cameras * 4 + seq_len
+        assert embs.shape == (bsize, expected_seq, 32)
+        assert pad_masks.shape == (bsize, expected_seq)
+        assert att_masks.shape == (bsize, expected_seq)
+
+    def test_batched_path_calls_encoder_once(self) -> None:
+        """In eval mode, embed_image should be called once (batched) not per-camera."""
+        from unittest.mock import patch
+
+        model = self._make_stub_model(hidden_dim=32, num_patches=4, training=False)
+        num_cameras, bsize = 3, 2
+
+        images = torch.randn(num_cameras, bsize, 3, 224, 224)
+        img_masks = torch.ones(num_cameras, bsize, dtype=torch.bool)
+        tokens = torch.randint(0, 100, (bsize, 10))
+        masks = torch.ones(bsize, 10, dtype=torch.bool)
+
+        call_count = [0]
+        orig_embed = model.paligemma_with_expert.embed_image
+
+        def _counting_embed(imgs: torch.Tensor) -> torch.Tensor:
+            call_count[0] += 1
+            return orig_embed(imgs)
+
+        model.paligemma_with_expert.embed_image = _counting_embed
+
+        model.embed_prefix(images, img_masks, tokens, masks)
+
+        assert call_count[0] == 1, f"Expected 1 batched call, got {call_count[0]}"
+
+    def test_training_path_calls_encoder_per_camera(self) -> None:
+        """In train mode, embed_image should be called once per camera."""
+        model = self._make_stub_model(hidden_dim=32, num_patches=4, training=True)
+        num_cameras, bsize = 3, 2
+
+        images = torch.randn(num_cameras, bsize, 3, 224, 224)
+        img_masks = torch.ones(num_cameras, bsize, dtype=torch.bool)
+        tokens = torch.randint(0, 100, (bsize, 10))
+        masks = torch.ones(bsize, 10, dtype=torch.bool)
+
+        call_count = [0]
+        orig_embed = model.paligemma_with_expert.embed_image
+
+        def _counting_embed(imgs: torch.Tensor) -> torch.Tensor:
+            call_count[0] += 1
+            return orig_embed(imgs)
+
+        model.paligemma_with_expert.embed_image = _counting_embed
+
+        model.embed_prefix(images, img_masks, tokens, masks)
+
+        assert call_count[0] == num_cameras, f"Expected {num_cameras} calls, got {call_count[0]}"
+
+    def test_eval_and_train_produce_same_shapes(self) -> None:
+        """Both paths should produce identical output shapes for same input."""
+        num_cameras, bsize, seq_len = 2, 4, 8
+
+        images = torch.randn(num_cameras, bsize, 3, 64, 64)
+        img_masks = torch.ones(num_cameras, bsize, dtype=torch.bool)
+        tokens = torch.randint(0, 100, (bsize, seq_len))
+        masks = torch.ones(bsize, seq_len, dtype=torch.bool)
+
+        model_eval = self._make_stub_model(hidden_dim=16, num_patches=4, training=False)
+        model_train = self._make_stub_model(hidden_dim=16, num_patches=4, training=True)
+
+        embs_e, pm_e, am_e = model_eval.embed_prefix(images, img_masks, tokens, masks)
+        embs_t, pm_t, am_t = model_train.embed_prefix(images, img_masks, tokens, masks)
+
+        assert embs_e.shape == embs_t.shape
+        assert pm_e.shape == pm_t.shape
+        assert am_e.shape == am_t.shape
+
+    def test_single_camera(self) -> None:
+        """Test with a single camera produces correct sequence length."""
+        model = self._make_stub_model(hidden_dim=32, num_patches=4, training=False)
+        bsize, seq_len = 2, 5
+
+        images = torch.randn(1, bsize, 3, 224, 224)
+        img_masks = torch.ones(1, bsize, dtype=torch.bool)
+        tokens = torch.randint(0, 100, (bsize, seq_len))
+        masks = torch.ones(bsize, seq_len, dtype=torch.bool)
+
+        embs, pad_masks, att_masks = model.embed_prefix(images, img_masks, tokens, masks)
+
+        expected_seq = 4 + seq_len  # 1 camera * 4 patches + lang tokens
+        assert embs.shape == (bsize, expected_seq, 32)
+
+    def test_pad_masks_reflect_img_masks(self) -> None:
+        """Padding masks should reflect which cameras are masked out."""
+        model = self._make_stub_model(hidden_dim=16, num_patches=4, training=False)
+        num_cameras, bsize, seq_len = 2, 2, 5
+
+        images = torch.randn(num_cameras, bsize, 3, 64, 64)
+        # First camera active, second camera masked for first sample
+        img_masks = torch.ones(num_cameras, bsize, dtype=torch.bool)
+        img_masks[1, 0] = False
+        tokens = torch.randint(0, 100, (bsize, seq_len))
+        masks = torch.ones(bsize, seq_len, dtype=torch.bool)
+
+        _, pad_masks, _ = model.embed_prefix(images, img_masks, tokens, masks)
+
+        # Second camera's patches (indices 4:8) should be False for sample 0
+        assert pad_masks[0, 4:8].sum() == 0
+        # But True for sample 1
+        assert pad_masks[1, 4:8].sum() == 4
+
+    def test_att_masks_all_false(self) -> None:
+        """All attention mask values should be False (non-autoregressive prefix)."""
+        model = self._make_stub_model(hidden_dim=16, num_patches=4, training=False)
+
+        images = torch.randn(2, 3, 3, 64, 64)
+        img_masks = torch.ones(2, 3, dtype=torch.bool)
+        tokens = torch.randint(0, 100, (3, 5))
+        masks = torch.ones(3, 5, dtype=torch.bool)
+
+        _, _, att_masks = model.embed_prefix(images, img_masks, tokens, masks)
+
+        assert not att_masks.any(), "All prefix attention masks should be False"
+
+
+# ============================================================================ #
+# Action Padding Mask                                                          #
+# ============================================================================ #
+
+
+class TestActionPaddingMask:
+    """Regression tests for end-of-episode action padding in the training loss.
+
+    LeRobot clamps action-chunk queries at episode boundaries (repeating the
+    final action) and flags the clamped steps as ``action_is_pad``. Those steps
+    must not contribute to the flow-matching loss, and must not count towards
+    its denominator either.
+    """
+
+    @staticmethod
+    def _compute_loss(
+        losses: torch.Tensor,
+        action_is_pad: torch.Tensor | None,
+        key_suffix: str = ".action_is_pad",
+    ) -> float:
+        """Run ``Pi05Model._flow_matching_loss`` against a stubbed model.
+
+        The stub pins noise to zeros and the ground-truth action to zeros, so the
+        flow-matching target ``u_t`` is zero and the per-element loss collapses to
+        ``_predict_velocity(...) ** 2``. Feeding back ``sqrt(losses)`` therefore
+        reproduces ``losses`` exactly.
+
+        Args:
+            losses: Per-element losses to materialise, shaped
+                ``(batch, chunk, action_dim)``.
+            action_is_pad: Optional ``(batch, chunk)`` bool padding mask.
+            key_suffix: Batch key the mask is stored under, relative to ``EXTRA``.
+                Overridable so a wrong key can be exercised.
+
+        Returns:
+            The scalar loss produced by ``_flow_matching_loss``.
+        """
+        from types import SimpleNamespace
+
+        from physicalai.data.constants import IMAGE_MASKS, TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK
+        from physicalai.data.observation import ACTION, EXTRA, IMAGES
+
+        bsize, chunk, action_dim = losses.shape
+        batch: dict = {
+            IMAGES: None,
+            IMAGE_MASKS: None,
+            TOKENIZED_PROMPT: None,
+            TOKENIZED_PROMPT_MASK: None,
+            ACTION: torch.zeros(bsize, chunk, action_dim),
+        }
+        if action_is_pad is not None:
+            batch[EXTRA + key_suffix] = action_is_pad
+
+        velocity = losses.clone().sqrt()
+        stub = SimpleNamespace(
+            _snapflow_enabled=False,
+            _dataset_stats={ACTION: {"shape": (action_dim,)}},
+            sample_noise=lambda shape, _device: torch.zeros(shape),
+            sample_time=lambda b, _device: torch.full((b,), 0.5),
+            embed_prefix=lambda *_a, **_kw: (None, None, None),
+            _predict_velocity=lambda *_a, **_kw: velocity,
+        )
+        loss, _ = Pi05Model._flow_matching_loss(stub, batch)
+        return float(loss)
+
+    def test_mask_is_read_from_lerobot_key_only(self) -> None:
+        """The mask must be read as ``action_is_pad``, LeRobot's actual key.
+
+        The lookup uses ``.get()``, so a typo'd key silently disables masking with
+        no error. This pins the exact spelling that
+        ``lerobot/datasets/dataset_reader.py`` emits.
+        """
+        losses = torch.tensor([[[1.0, 1.0], [1.0, 1.0], [99.0, 99.0], [99.0, 99.0]]])
+        action_is_pad = torch.tensor([[False, False, True, True]])
+
+        correct_key = self._compute_loss(losses, action_is_pad)
+        typo_key = self._compute_loss(losses, action_is_pad, key_suffix=".actions_id_pad")
+
+        assert correct_key == pytest.approx(1.0), "mask under the LeRobot key must apply"
+        assert typo_key == pytest.approx(50.0), "a wrong key must not silently half-apply"
+
+    def test_padded_steps_are_excluded_from_the_loss(self) -> None:
+        """Padded steps contribute nothing, regardless of their magnitude."""
+        losses = torch.tensor([[[1.0, 1.0], [1.0, 1.0], [99.0, 99.0], [99.0, 99.0]]])
+        action_is_pad = torch.tensor([[False, False, True, True]])
+
+        masked = self._compute_loss(losses, action_is_pad)
+        unmasked = self._compute_loss(losses, None)
+
+        assert masked == pytest.approx(1.0), "padded steps must not affect the loss"
+        assert unmasked == pytest.approx(50.0), "without a mask the padding dominates"
+
+    def test_denominator_counts_only_valid_steps(self) -> None:
+        """The loss divides by valid elements, not by the full tensor.
+
+        Chosen so all three behaviours are distinguishable:
+        correct = 2.0, mask-with-plain-mean = 1.0, no-mask = 50.5.
+        A plain ``.mean()`` over the zeroed tensor would scale the loss - and
+        therefore the gradient - down by the padding fraction.
+        """
+        losses = torch.tensor([[[2.0, 2.0], [2.0, 2.0], [99.0, 99.0], [99.0, 99.0]]])
+        action_is_pad = torch.tensor([[False, False, True, True]])
+
+        masked = self._compute_loss(losses, action_is_pad)
+
+        assert masked == pytest.approx(2.0)
+        assert masked != pytest.approx(1.0), "denominator must exclude padded elements"
+        assert masked != pytest.approx(50.5), "mask must be applied at all"
+
+    def test_padding_fraction_does_not_change_the_loss_scale(self) -> None:
+        """Two batches with identical valid steps but different padding agree.
+
+        This is the property that actually matters for training: the gradient
+        magnitude on real frames must not depend on how close to the end of an
+        episode the sample was drawn.
+        """
+        one_padded = torch.tensor([[[3.0, 3.0], [3.0, 3.0], [3.0, 3.0], [99.0, 99.0]]])
+        three_padded = torch.tensor([[[3.0, 3.0], [99.0, 99.0], [99.0, 99.0], [99.0, 99.0]]])
+
+        loss_one = self._compute_loss(one_padded, torch.tensor([[False, False, False, True]]))
+        loss_three = self._compute_loss(three_padded, torch.tensor([[False, True, True, True]]))
+
+        assert loss_one == pytest.approx(3.0)
+        assert loss_three == pytest.approx(3.0)
+
+    def test_fully_padded_chunk_does_not_divide_by_zero(self) -> None:
+        """An all-padded chunk clamps the denominator instead of producing NaN."""
+        losses = torch.ones(1, 4, 2)
+        action_is_pad = torch.ones(1, 4, dtype=torch.bool)
+
+        masked = self._compute_loss(losses, action_is_pad)
+
+        assert masked == pytest.approx(0.0)
+
+    def test_no_mask_falls_back_to_plain_mean(self) -> None:
+        """Batches without the key (e.g. non-chunked datasets) keep the old path."""
+        losses = torch.full((2, 3, 2), 4.0)
+        assert self._compute_loss(losses, None) == pytest.approx(4.0)
+
+    def test_mask_applies_per_sample_across_the_batch(self) -> None:
+        """Each row uses its own mask, not a batch-wide reduction."""
+        losses = torch.tensor([
+            [[1.0], [99.0]],
+            [[3.0], [3.0]],
+        ])
+        action_is_pad = torch.tensor([[False, True], [False, False]])
+
+        # Valid elements: 1.0 (row 0), 3.0 and 3.0 (row 1) -> 7/3.
+        assert self._compute_loss(losses, action_is_pad) == pytest.approx(7.0 / 3.0)
+
+    def test_masking_is_autograd_safe(self) -> None:
+        """Gradients flow to valid steps and are exactly zero on padded steps."""
+        from types import SimpleNamespace
+
+        from physicalai.data.constants import IMAGE_MASKS, TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK
+        from physicalai.data.observation import ACTION, EXTRA, IMAGES
+
+        source = torch.ones(1, 4, 2, requires_grad=True)
+        action_is_pad = torch.tensor([[False, False, True, True]])
+
+        stub = SimpleNamespace(
+            _snapflow_enabled=False,
+            _dataset_stats={ACTION: {"shape": (2,)}},
+            sample_noise=lambda shape, _device: torch.zeros(shape),
+            sample_time=lambda b, _device: torch.full((b,), 0.5),
+            embed_prefix=lambda *_a, **_kw: (None, None, None),
+            _predict_velocity=lambda *_a, **_kw: source * 2.0,
+        )
+        batch: dict = {
+            IMAGES: None,
+            IMAGE_MASKS: None,
+            TOKENIZED_PROMPT: None,
+            TOKENIZED_PROMPT_MASK: None,
+            ACTION: torch.zeros(1, 4, 2),
+            EXTRA + ".action_is_pad": action_is_pad,
+        }
+
+        loss, _ = Pi05Model._flow_matching_loss(stub, batch)
+        loss.backward()
+
+        assert source.grad is not None
+        assert torch.all(source.grad[0, :2] != 0), "valid steps must receive gradient"
+        assert torch.all(source.grad[0, 2:] == 0), "padded steps must receive zero gradient"
+
+    def test_snapflow_distillation_steps_ignore_the_pad_mask(self) -> None:
+        """Consistency-distillation samples stay fully weighted.
+
+        The SnapFlow branch regresses the one-step student onto a self-generated
+        two-step teacher, so it never reads the dataset action. Padded steps carry
+        no bad supervision there, and masking them would silently drop valid
+        distillation signal from the tail of every chunk.
+        """
+        from types import SimpleNamespace
+
+        from physicalai.data.constants import IMAGE_MASKS, TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK
+        from physicalai.data.observation import ACTION, EXTRA, IMAGES
+        from physicalai.policies.mixins import SnapFlowModelMixin
+
+        velocity = torch.tensor([[[1.0, 1.0], [1.0, 1.0], [99.0, 99.0], [99.0, 99.0]]]).sqrt()
+
+        calls: list[int] = []
+
+        def predict(*_a: object, **_kw: object) -> torch.Tensor:
+            # Call order inside the CD branch: v_1, v_half, then v_pred.
+            calls.append(1)
+            return velocity if len(calls) >= 3 else torch.zeros_like(velocity)
+
+        stub = SimpleNamespace(
+            # alpha=0 routes every sample down the consistency-distillation path.
+            _snapflow_enabled=True,
+            _snapflow_alpha=0.0,
+            _snapflow_lambda=1.0,
+            _dataset_stats={ACTION: {"shape": (2,)}},
+            sample_noise=lambda shape, _device: torch.zeros(shape),
+            sample_time=lambda b, _device: torch.full((b,), 0.5),
+            embed_prefix=lambda *_a, **_kw: (torch.zeros(1, 1, 1),) * 3,
+            _predict_velocity=predict,
+        )
+        stub.snapflow_mixed_loss = SnapFlowModelMixin.snapflow_mixed_loss.__get__(stub)
+        batch: dict = {
+            IMAGES: None,
+            IMAGE_MASKS: None,
+            TOKENIZED_PROMPT: None,
+            TOKENIZED_PROMPT_MASK: None,
+            ACTION: torch.zeros(1, 4, 2),
+            EXTRA + ".action_is_pad": torch.tensor([[False, False, True, True]]),
+        }
+
+        loss, _ = Pi05Model._flow_matching_loss(stub, batch)
+
+        assert float(loss) == pytest.approx(50.0), "distillation steps must not be masked"
+
+    @staticmethod
+    def _compute_val_loss(
+        squared_error: torch.Tensor,
+        action_is_pad: torch.Tensor | None,
+        pred_len: int | None = None,
+    ) -> float:
+        """Run ``Pi05Model.compute_val_loss`` against a stubbed model.
+
+        Ground truth is pinned to zeros and the prediction to ``sqrt(error)``, so
+        the per-element squared error is exactly ``squared_error``.
+
+        Args:
+            squared_error: Desired per-element squared error, shaped
+                ``(batch, chunk, action_dim)``.
+            action_is_pad: Optional ``(batch, chunk)`` bool padding mask.
+            pred_len: Optional shorter prediction length, emulating a chunk
+                clipped by ``n_action_steps``.
+
+        Returns:
+            The scalar validation loss.
+        """
+        from types import SimpleNamespace
+
+        from physicalai.data.observation import ACTION, EXTRA
+
+        bsize, chunk, action_dim = squared_error.shape
+        predicted = squared_error.sqrt()
+        if pred_len is not None:
+            predicted = predicted[:, :pred_len]
+
+        batch: dict = {ACTION: torch.zeros(bsize, chunk, action_dim)}
+        if action_is_pad is not None:
+            batch[EXTRA + ".action_is_pad"] = action_is_pad
+
+        stub = SimpleNamespace(
+            _dataset_stats={ACTION: {"shape": (action_dim,)}},
+            predict_action_chunk=lambda _b: predicted,
+        )
+        loss, _ = Pi05Model.compute_val_loss(stub, batch)
+        return float(loss)
+
+    def test_val_loss_excludes_padded_steps(self) -> None:
+        """``val/loss`` must measure real frames, not repeated terminal actions.
+
+        Otherwise the reported metric is diluted by whatever the policy happens
+        to do on the frozen tail of each episode.
+        """
+        squared_error = torch.tensor([[[1.0, 1.0], [1.0, 1.0], [99.0, 99.0], [99.0, 99.0]]])
+        action_is_pad = torch.tensor([[False, False, True, True]])
+
+        masked = self._compute_val_loss(squared_error, action_is_pad)
+        unmasked = self._compute_val_loss(squared_error, None)
+
+        assert masked == pytest.approx(1.0)
+        assert unmasked == pytest.approx(50.0), "without a mask the padding dominates"
+
+    def test_val_loss_denominator_counts_only_valid_steps(self) -> None:
+        """Valid elements set the denominator, so the metric keeps its scale."""
+        squared_error = torch.tensor([[[2.0, 2.0], [2.0, 2.0], [99.0, 99.0], [99.0, 99.0]]])
+        action_is_pad = torch.tensor([[False, False, True, True]])
+
+        assert self._compute_val_loss(squared_error, action_is_pad) == pytest.approx(2.0)
+
+    def test_val_loss_mask_is_clipped_to_the_prediction_length(self) -> None:
+        """The mask is sliced to ``min_len`` when ``n_action_steps`` clips the chunk.
+
+        ``predict_action_chunk`` may return fewer steps than the ground-truth
+        chunk. The mask is ``chunk``-long, so it must be trimmed to match or the
+        reduction would broadcast against the wrong length.
+        """
+        squared_error = torch.tensor([[[5.0, 5.0], [5.0, 5.0], [99.0, 99.0], [99.0, 99.0]]])
+        action_is_pad = torch.tensor([[False, False, True, True]])
+
+        # pred_len=3 leaves one padded step inside the compared window, so the
+        # mask still has to do work after being trimmed from 4 to 3.
+        assert self._compute_val_loss(squared_error, action_is_pad, pred_len=3) == pytest.approx(5.0)
+
+    def test_val_loss_without_mask_falls_back_to_plain_mean(self) -> None:
+        """Batches without the key keep the previous behaviour."""
+        assert self._compute_val_loss(torch.full((2, 3, 2), 4.0), None) == pytest.approx(4.0)
+
+
+# ============================================================================ #
+# LoRA (PEFT) Configuration Tests                                              #
+# ============================================================================ #
+
+
+class TestPi05LoRAConfig:
+    """Tests for Pi05Config LoRA fields and validation."""
+
+    def test_lora_disabled_by_default(self) -> None:
+        """Test LoRA is disabled by default."""
+        config = Pi05Config()
+        assert config.lora_enabled is False
+        assert config.use_lora is False
+        # Rank/alpha still have sensible defaults even when disabled.
+        assert config.lora_rank == 32
+
+    def test_use_lora_true_when_enabled(self) -> None:
+        """Test use_lora mirrors lora_enabled."""
+        config = Pi05Config(lora_enabled=True)
+        assert config.use_lora is True
+
+    def test_lora_default_values(self) -> None:
+        """Test default LoRA hyperparameters are sensible without any tuning."""
+        config = Pi05Config(lora_enabled=True)
+        assert config.lora_rank == 32
+        assert config.lora_alpha is None
+        assert config.effective_lora_alpha == 32
+        assert config.lora_dropout == 0.05
+        assert config.lora_target_modules is None
+        assert config.lora_adapter_dtype == "float32"
+        assert config.lora_use_dora is False
+
+    def test_effective_lora_alpha_resolves_to_rank(self) -> None:
+        """Test effective_lora_alpha defaults to lora_rank (scaling=1.0) when alpha is None."""
+        config = Pi05Config(lora_enabled=True, lora_rank=64)
+        assert config.lora_alpha is None
+        assert config.effective_lora_alpha == 64
+
+    def test_effective_lora_alpha_respects_explicit_value(self) -> None:
+        """Test effective_lora_alpha uses the explicit lora_alpha when set."""
+        config = Pi05Config(lora_enabled=True, lora_rank=64, lora_alpha=128)
+        assert config.effective_lora_alpha == 128
+
+    def test_lora_rank_negative_rejected(self) -> None:
+        """Test negative lora_rank is rejected."""
+        with pytest.raises(ValueError, match="lora_rank"):
+            Pi05Config(lora_rank=-1)
+
+    def test_lora_enabled_requires_positive_rank(self) -> None:
+        """Test lora_enabled=True with lora_rank=0 is rejected."""
+        with pytest.raises(ValueError, match="lora_rank"):
+            Pi05Config(lora_enabled=True, lora_rank=0)
+
+    def test_lora_alpha_must_be_positive_when_enabled(self) -> None:
+        """Test lora_alpha must be > 0 when LoRA is enabled."""
+        with pytest.raises(ValueError, match="lora_alpha"):
+            Pi05Config(lora_enabled=True, lora_rank=8, lora_alpha=0)
+
+    def test_lora_dropout_out_of_range_rejected(self) -> None:
+        """Test lora_dropout must be in [0, 1)."""
+        with pytest.raises(ValueError, match="lora_dropout"):
+            Pi05Config(lora_dropout=1.0)
+        with pytest.raises(ValueError, match="lora_dropout"):
+            Pi05Config(lora_dropout=-0.1)
+
+    def test_lora_adapter_dtype_validation(self) -> None:
+        """Test lora_adapter_dtype must be 'float32' or 'auto'."""
+        with pytest.raises(ValueError, match="Invalid lora_adapter_dtype"):
+            Pi05Config(lora_adapter_dtype="bfloat16")
+
+    def test_lora_target_modules_custom(self) -> None:
+        """Test custom lora_target_modules is stored as-is."""
+        config = Pi05Config(lora_enabled=True, lora_target_modules=("q_proj", "v_proj"))
+        assert config.lora_target_modules == ("q_proj", "v_proj")
+
+    def test_lora_use_dora_default_false(self) -> None:
+        """Test lora_use_dora defaults to False."""
+        config = Pi05Config(lora_enabled=True)
+        assert config.lora_use_dora is False
+
+    def test_lora_use_dora_enabled(self) -> None:
+        """Test lora_use_dora can be enabled."""
+        config = Pi05Config(lora_enabled=True, lora_use_dora=True)
+        assert config.lora_use_dora is True
+
+    def test_lora_serialization_roundtrip(self) -> None:
+        """Test LoRA fields survive to_dict/from_dict roundtrip."""
+        config = Pi05Config(
+            lora_enabled=True,
+            lora_rank=32,
+            lora_alpha=64,
+            lora_dropout=0.1,
+            lora_use_dora=True,
+        )
+        restored = Pi05Config.from_dict(config.to_dict())
+        assert restored.lora_enabled is True
+        assert restored.lora_rank == 32
+        assert restored.lora_alpha == 64
+        assert restored.lora_dropout == 0.1
+        assert restored.lora_use_dora is True
+        assert restored.use_lora is True
+
+    def test_lora_enabled_rejects_non_default_freeze_vision_encoder(self) -> None:
+        """Test lora_enabled=True with freeze_vision_encoder=True (non-default) is rejected."""
+        with pytest.raises(ValueError, match="freeze_vision_encoder"):
+            Pi05Config(lora_enabled=True, freeze_vision_encoder=True)
+
+    def test_lora_enabled_rejects_non_default_train_expert_only(self) -> None:
+        """Test lora_enabled=True with train_expert_only=True (non-default) is rejected."""
+        with pytest.raises(ValueError, match="train_expert_only"):
+            Pi05Config(lora_enabled=True, train_expert_only=True)
+
+    def test_lora_enabled_allows_default_freeze_flags(self) -> None:
+        """Test lora_enabled=True with freeze flags at their defaults is allowed."""
+        config = Pi05Config(lora_enabled=True, freeze_vision_encoder=False, train_expert_only=False)
+        assert config.use_lora is True
+
+    def test_freeze_flags_allowed_when_lora_disabled(self) -> None:
+        """Test non-default freeze flags are fine when LoRA is disabled."""
+        config = Pi05Config(lora_enabled=False, train_expert_only=True)
+        assert config.train_expert_only is True
+
+
+    """Construction-only Pi05 + LoRA integration tests.
+
+    These construct a real Pi05Model, but both the VLM backbone and action expert use
+    a tiny stand-in config (see ``_patch_tiny_gemma_config`` below) so they run in
+    seconds without ever calling ``forward``. Forward-pass tests for LoRA (merge/export
+    equivalence, backward gradients, checkpoint roundtrip) require a real gemma_2b-sized
+    backbone -- see ``tests/integration/test_pi05_lora_forward.py`` -- because
+    ``PaliGemmaWithExpertModel`` hardcodes ``vision_config.projection_dim = 2048``
+    regardless of variant, so those cannot be shrunk without a production code change.
+
+    Tests for the shared, policy-agnostic LoRA/DoRA helpers themselves live in
+    ``tests/unit/policies/test_peft.py``.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_tiny_gemma_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Shrink the VLM backbone and action expert to a tiny, uniform config.
+
+        Also shrinks the vision tower, which otherwise defaults to the full SigLIP-so400m
+        size (``hidden_size=1152``, 27 layers) regardless of ``paligemma_variant``.
+        """
+        import physicalai.policies.pi05.model as pi05_model_mod
+
+        tiny = pi05_model_mod.GemmaVariantConfig(
+            width=64,
+            depth=2,
+            mlp_dim=128,
+            num_heads=1,
+            num_kv_heads=1,
+            head_dim=64,
+        )
+        monkeypatch.setattr(pi05_model_mod, "get_gemma_config", lambda variant: tiny)  # noqa: ARG005
+
+        orig_config_mapping_getitem = pi05_model_mod.CONFIG_MAPPING.__getitem__
+
+        def _tiny_paligemma_factory() -> object:
+            cfg = orig_config_mapping_getitem("paligemma")()
+            cfg.vision_config.hidden_size = 32
+            cfg.vision_config.intermediate_size = 64
+            cfg.vision_config.num_hidden_layers = 1
+            cfg.vision_config.num_attention_heads = 1
+            return cfg
+
+        class _TinyConfigMapping(dict):
+            def __getitem__(self, key: str) -> object:
+                if key == "paligemma":
+                    return _tiny_paligemma_factory
+                return orig_config_mapping_getitem(key)
+
+        monkeypatch.setattr(pi05_model_mod, "CONFIG_MAPPING", _TinyConfigMapping())
+
+    @staticmethod
+    def _stats() -> dict:
+        return {
+            "observation.state": {
+                "name": "observation.state",
+                "shape": (8,),
+                "mean": [0.0] * 8,
+                "std": [1.0] * 8,
+                "q01": [-1.0] * 8,
+                "q99": [1.0] * 8,
+            },
+            "action": {
+                "name": "action",
+                "shape": (7,),
+                "mean": [0.0] * 7,
+                "std": [1.0] * 7,
+                "q01": [-1.0] * 7,
+                "q99": [1.0] * 7,
+            },
+        }
+
+    def test_lora_injection_reduces_trainable_params(self) -> None:
+        """Test enabling LoRA drastically reduces the number of trainable parameters."""
+        policy = Pi05(
+            dataset_stats=self._stats(),
+            paligemma_variant="gemma_300m",
+            action_expert_variant="gemma_300m",
+            lora_enabled=True,
+            lora_rank=4,
+            lora_alpha=8,
+        )
+        assert policy.config.use_lora
+        from physicalai.policies.mixins.peft import is_lora_injected
+
+        assert is_lora_injected(policy.model)
+
+        trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in policy.parameters())
+        assert 0 < trainable < total
+        assert trainable / total < 0.01, "LoRA should train well under 1% of parameters"
+
+    def test_lora_adapters_default_to_float32_under_bfloat16_base(self) -> None:
+        """Test LoRA adapter parameters are fp32 even when the base model is bf16."""
+        policy = Pi05(
+            dataset_stats=self._stats(),
+            paligemma_variant="gemma_300m",
+            action_expert_variant="gemma_300m",
+            dtype="bfloat16",
+            lora_enabled=True,
+            lora_rank=4,
+            lora_alpha=8,
+        )
+        lora_dtypes = {p.dtype for n, p in policy.named_parameters() if "lora_" in n}
+        assert lora_dtypes == {torch.float32}
+
+    def test_lora_adapter_dtype_auto_inherits_base_dtype(self) -> None:
+        """Test lora_adapter_dtype='auto' lets adapters inherit the base layer's dtype."""
+        policy = Pi05(
+            dataset_stats=self._stats(),
+            paligemma_variant="gemma_300m",
+            action_expert_variant="gemma_300m",
+            dtype="bfloat16",
+            lora_enabled=True,
+            lora_rank=4,
+            lora_alpha=8,
+            lora_adapter_dtype="auto",
+        )
+        lora_dtypes = {p.dtype for n, p in policy.named_parameters() if "lora_" in n}
+        assert torch.bfloat16 in lora_dtypes
+
+    def test_dora_injection_on_full_model(self) -> None:
+        """Test lora_use_dora=True injects DoRA adapters (magnitude vector) on Pi05Model."""
+        policy = Pi05(
+            dataset_stats=self._stats(),
+            paligemma_variant="gemma_300m",
+            action_expert_variant="gemma_300m",
+            lora_enabled=True,
+            lora_rank=4,
+            lora_alpha=8,
+            lora_use_dora=True,
+        )
+        assert policy.config.lora_use_dora is True
+        from physicalai.policies.mixins.peft import is_lora_injected
+
+        assert is_lora_injected(policy.model)
+        param_names = {n for n, _ in policy.named_parameters()}
+        assert any("lora_magnitude_vector" in n for n in param_names)
+
+        trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in policy.parameters())
+        assert 0 < trainable < total
+
+
+class TestTrainingNoise:
+    """``use_random_input_noise=False`` only fixes the inference start; training must sample noise."""
+
+    @pytest.mark.parametrize("training", [True, False])
+    def test_zero_noise_only_at_inference(self, training: bool) -> None:
+        stub = SimpleNamespace(_use_random_input_noise=False, training=training)
+        noise = Pi05Model.sample_noise(stub, (2, 4, 3), torch.device("cpu"))
+
+        assert bool(noise.any()) is training

@@ -1,0 +1,85 @@
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, status
+
+from api.dependencies import RuntimeSessionRegistryDep, get_robot_service
+from schemas.robot import (
+    ReadableRobot,
+    Robot,
+    RobotWithConnectionState,
+    UnavailableRobot,
+    UnavailableRobotWithConnectionState,
+)
+from services import RobotService
+
+router = APIRouter(prefix="/api/projects/{project_id}/robots", tags=["Project Robots"])
+
+ProjectID = UUID
+
+
+@router.get("")
+async def list_project_robots(
+    project_id: ProjectID,
+    robot_service: Annotated[RobotService, Depends(get_robot_service)],
+) -> list[ReadableRobot]:
+    """Fetch all robots."""
+    return await robot_service.get_robot_list(project_id)
+
+
+@router.get("/online")
+async def list_online_project_robots(
+    project_id: ProjectID,
+    robot_service: Annotated[RobotService, Depends(get_robot_service)],
+) -> list[RobotWithConnectionState | UnavailableRobotWithConnectionState]:
+    """Fetch all robots."""
+    return await robot_service.find_online_robots(project_id)
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_project_robot(
+    project_id: ProjectID,
+    robot: Robot,
+    robot_service: Annotated[RobotService, Depends(get_robot_service)],
+) -> Robot:
+    """Create a new robot."""
+    return await robot_service.create_robot(project_id, robot)
+
+
+@router.get("/{robot_id}")
+async def get_project_robot(
+    project_id: ProjectID,
+    robot_id: UUID,
+    robot_service: Annotated[RobotService, Depends(get_robot_service)],
+) -> Robot | UnavailableRobot:
+    """Get robot by id."""
+    return await robot_service.get_robot_by_id(project_id, robot_id)
+
+
+@router.put("/{robot_id}")
+async def update_project_robot(
+    project_id: ProjectID,
+    robot_id: UUID,
+    robot_service: Annotated[RobotService, Depends(get_robot_service)],
+    robot: Robot,
+) -> Robot:
+    """Set robot."""
+    robot_with_id = robot.model_copy(update={"id": robot_id})
+
+    return await robot_service.update_robot(
+        project_id,
+        robot_with_id,
+    )
+
+
+@router.delete("/{robot_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_project_robot(
+    project_id: ProjectID,
+    robot_id: UUID,
+    robot_service: Annotated[RobotService, Depends(get_robot_service)],
+    registry: RuntimeSessionRegistryDep,
+) -> None:
+    """Delete a robot."""
+    robot = await robot_service.get_robot_by_id(project_id, robot_id)
+    registry.require_robot_free(robot.id, robot.name)
+    await robot_service.delete_robot(project_id, robot_id)

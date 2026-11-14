@@ -1,0 +1,257 @@
+import http
+from collections import defaultdict
+from collections.abc import Sequence
+
+import pydantic
+from fastapi import FastAPI, Request, Response, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from loguru import logger
+from physicalai.data.archive_safety import InsufficientDiskSpaceError as ArchiveInsufficientDiskSpaceError
+from physicalai.data.archive_safety import InvalidArchiveError as ArchiveInvalidArchiveError
+from physicalai.data.archive_safety import ZipBombDetectedError as ArchiveZipBombDetectedError
+from serial.serialutil import SerialException
+
+from exceptions import BaseException
+
+_ARCHIVE_ERROR_DETAILS: dict[type[Exception], tuple[str, int]] = {
+    ArchiveInvalidArchiveError: ("invalid_archive", http.HTTPStatus.BAD_REQUEST),
+    ArchiveZipBombDetectedError: ("zip_bomb_detected", http.HTTPStatus.REQUEST_ENTITY_TOO_LARGE),
+    ArchiveInsufficientDiskSpaceError: ("insufficient_disk_space", http.HTTPStatus.INSUFFICIENT_STORAGE),
+}
+
+
+def _log_handled_exception(request: Request, http_status: int, summary: str, exception: Exception) -> None:
+    """Log an exception that is converted into an error response.
+
+    Client errors are logged as warnings; server errors include the traceback.
+    The underlying cause is logged with its traceback so failures from robot
+    plugins or serial ports stay diagnosable even though the client only sees
+    a sanitized message.
+    """
+    location = f"{request.method} {request.url.path}"
+    if http_status >= 500:
+        logger.opt(exception=exception).error(f"{location} -> {http_status} {summary}")
+        return
+    cause = exception.__cause__ or exception.__context__
+    if cause is not None:
+        logger.opt(exception=cause).warning(f"{location} -> {http_status} {summary} (cause: {cause!r})")
+    else:
+        logger.warning(f"{location} -> {http_status} {summary}")
+
+
+def handle_base_exception(request: Request, exception: Exception) -> Response:
+    """
+    Base exception handler
+    """
+    if isinstance(exception, BaseException):
+        error_code = exception.error_code
+        message = exception.message
+        http_status = exception.http_status
+    elif details := _ARCHIVE_ERROR_DETAILS.get(type(exception)):
+        error_code, http_status = details
+        message = str(exception)
+    else:
+        raise exception
+
+    _log_handled_exception(request, int(http_status), f"{error_code}: {message}", exception)
+
+    response_data = {"error_code": error_code, "message": message, "http_status": http_status}
+    if isinstance(exception, BaseException):
+        response_data.update(exception.details)
+    response = jsonable_encoder(response_data)
+    headers: dict[str, str] | None = None
+    # 204 skipped as No Content needs to be revalidated
+    if http_status not in [200, 201, 202, 203, 205, 206, 207, 208, 226] and request.method == "GET":
+        headers = {"Cache-Control": "no-cache"}  # always revalidate
+    if http_status in [204, 304] or http_status < 200:
+        return Response(status_code=int(http_status), headers=headers)
+    return JSONResponse(content=response, status_code=int(http_status), headers=headers)
+
+
+async def handle_error(_request: Request, exception: Exception) -> JSONResponse:
+    """
+    Handler for internal server errors
+    """
+
+    logger.exception(f"Internal server error: {exception}")
+    headers = {"Cache-Control": "no-cache"}  # always revalidate
+    return JSONResponse(
+        {"internal_server_error": "An internal server error occurred."},
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        headers=headers,
+    )
+
+
+async def handle_not_found(request: Request, _exception: Exception) -> JSONResponse:
+    """Handler for 'endpoint not found' errors"""
+    message = f"Endpoint {request.url} is not found"
+    logger.info(message)
+    headers = {"Cache-Control": "no-cache"}  # always revalidate
+    return JSONResponse(
+        {"endpoint_not_found_response": message},
+        status_code=status.HTTP_404_NOT_FOUND,
+        headers=headers,
+    )
+
+
+async def validation_exception_handler(request: Request, exception: Exception) -> JSONResponse:
+    """
+    Converts a RequestValidationError to a better readable Bad request exception.
+    """
+    if not isinstance(exception, RequestValidationError):
+        raise exception
+
+    reformatted_message = defaultdict(list)
+    for pydantic_error in exception.errors():
+        # `loc` usually is a list with 2 items describing the location of the error.
+        # The first item specifies if the error is a body, query or path parameter and
+        # the second is the parameter name. Here, only the parameter name is used along
+        # with a message explaining what the problem with the parameter is.
+        loc, msg = pydantic_error["loc"], pydantic_error["msg"]
+        filtered_loc = loc[1:] if loc[0] in ("body", "query", "path") else loc
+        # Report nested fields as dot-separated path segments.
+        field_string = ".".join(str(segment) for segment in filtered_loc)
+        reformatted_message[field_string].append(msg)
+
+    _log_handled_exception(request, http.HTTPStatus.BAD_REQUEST, f"bad_request: {dict(reformatted_message)}", exception)
+    headers = {"Cache-Control": "no-cache"}  # always revalidate
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content=jsonable_encoder(
+            {
+                "error_code": "bad_request",
+                "message": reformatted_message,
+                "http_status": http.HTTPStatus.BAD_REQUEST.value,
+            }
+        ),
+        headers=headers,
+    )
+
+
+async def pydantic_validation_exception_handler(request: Request, exception: Exception) -> JSONResponse:
+    """
+    Converts a pydantic ValidationError to a better readable Bad request exception.
+    """
+    if not isinstance(exception, pydantic.ValidationError):
+        raise exception
+
+    def format_location(loc: Sequence[str | int]) -> str:
+        """
+        Format location path with proper dot notation and array indices.
+
+        Example:
+            format_location(['a', 0, 'b', 1, 'c']) -> 'a[0].b[1].c'
+        """
+        result = ""
+        for i, item in enumerate(loc):
+            if isinstance(item, int):
+                result += f"[{item}]"
+            else:
+                result += f".{item}" if i > 0 else str(item)
+        return result
+
+    errors = [
+        {"message": error["msg"], "type": error["type"], "location": format_location(error.get("loc", []))}
+        for error in exception.errors()
+    ]
+    _log_handled_exception(request, http.HTTPStatus.BAD_REQUEST, f"invalid_payload: {errors}", exception)
+
+    headers = {"Cache-Control": "no-cache"}  # always revalidate
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content=jsonable_encoder(
+            {
+                "error_code": "invalid_payload",
+                "errors": errors,
+                "http_status": http.HTTPStatus.BAD_REQUEST.value,
+            }
+        ),
+        headers=headers,
+    )
+
+
+async def connection_error_exception_handler(request: Request, exception: Exception) -> JSONResponse:
+    """Convert serial connection errors to a client-facing 4xx response."""
+    if not isinstance(exception, ConnectionError):
+        raise exception
+
+    cause = exception.__cause__ or exception.__context__
+    is_permission_denied = isinstance(cause, PermissionError) or (
+        isinstance(cause, SerialException) and getattr(cause, "errno", None) == 13
+    )
+
+    if is_permission_denied:
+        payload = {
+            "error_code": "serial_permission_denied",
+            "message": (
+                "Permission denied while opening the serial device. "
+                "Grant your user access to the serial port and try again."
+            ),
+            "http_status": http.HTTPStatus.FORBIDDEN.value,
+        }
+        status_code = status.HTTP_403_FORBIDDEN
+    else:
+        payload = {
+            "error_code": "serial_connection_error",
+            "message": "Could not connect to the robot on the requested serial port.",
+            "http_status": http.HTTPStatus.BAD_REQUEST.value,
+        }
+        status_code = status.HTTP_400_BAD_REQUEST
+
+    _log_handled_exception(request, status_code, f"{payload['error_code']}: {exception}", exception)
+    headers = {"Cache-Control": "no-cache"}
+    return JSONResponse(status_code=status_code, content=jsonable_encoder(payload), headers=headers)
+
+
+def _rewrite_validation_error_status_code(schema: dict) -> dict:
+    """Replace FastAPI's default 422 validation-error response with 400.
+
+    `validation_exception_handler` converts every `RequestValidationError` to a 400
+    response app-wide, so the auto-generated 422 entry never reflects reality.
+    """
+    for path_item in schema.get("paths", {}).values():
+        for operation in path_item.values():
+            responses = operation.get("responses") if isinstance(operation, dict) else None
+            if isinstance(responses, dict) and "422" in responses:
+                validation = responses.pop("422")
+                if "400" not in responses:
+                    responses["400"] = validation
+                else:
+                    content = responses["400"].setdefault("content", {})
+                    for media_type, media in validation.get("content", {}).items():
+                        if media_type not in content:
+                            content[media_type] = media
+                        else:
+                            content[media_type]["schema"] = {"anyOf": [content[media_type]["schema"], media["schema"]]}
+    return schema
+
+
+def _register_openapi_validation_status_override(app: FastAPI) -> None:
+    """Keep the generated OpenAPI schema in sync with validation_exception_handler's status code."""
+    original_openapi = app.openapi
+
+    def custom_openapi() -> dict:
+        return _rewrite_validation_error_status_code(original_openapi())
+
+    app.openapi = custom_openapi  # type: ignore[method-assign]  # standard FastAPI override pattern
+
+
+def register_application_exception_handlers(app: FastAPI) -> None:
+    """
+    Register application exception handlers
+    """
+    app.add_exception_handler(BaseException, handle_base_exception)
+    app.add_exception_handler(ArchiveInvalidArchiveError, handle_base_exception)
+    app.add_exception_handler(ArchiveZipBombDetectedError, handle_base_exception)
+    app.add_exception_handler(ArchiveInsufficientDiskSpaceError, handle_base_exception)
+
+    app.add_exception_handler(500, handle_error)
+    app.add_exception_handler(404, handle_not_found)
+
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(pydantic.ValidationError, pydantic_validation_exception_handler)
+    app.add_exception_handler(ConnectionError, connection_error_exception_handler)
+
+    _register_openapi_validation_status_override(app)

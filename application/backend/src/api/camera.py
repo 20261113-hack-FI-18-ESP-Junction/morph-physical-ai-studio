@@ -1,0 +1,153 @@
+import asyncio
+import json
+from collections import defaultdict
+from functools import cache
+from typing import Annotated
+
+import anyio
+from fastapi import APIRouter, Depends, Query, WebSocket, status
+from fastapi.responses import Response
+from fastapi.websockets import WebSocketDisconnect
+
+from api.dependencies import CameraClaimRegistryDep
+from exceptions import DeviceInUseError
+from schemas.camera import SupportedCameraFormat
+from schemas.project_camera import Camera as ProjectCamera
+from schemas.project_camera import CameraAdapter
+from schemas.robot_stream import ErrorEvent
+from utils.camera_factory import build_shared_camera
+from workers.rate import Rate
+
+router = APIRouter(prefix="/api/cameras", tags=["Cameras"])
+
+
+def _formats_to_response(raw: list[tuple[int, int, int]]) -> list[SupportedCameraFormat]:
+    """Group (w, h, fps) tuples into SupportedCameraFormat responses."""
+    grouped: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for w, h, fps in raw:
+        grouped[(w, h)].append(fps)
+
+    return [
+        SupportedCameraFormat(width=w, height=h, fps=sorted(fps_list)) for (w, h), fps_list in sorted(grouped.items())
+    ]
+
+
+# Cache required on MacOS to avoid repeated cam.open() which may block camera stream
+@cache
+def _query_formats(driver: str, fingerprint_key: str) -> list[SupportedCameraFormat]:
+    """Query real formats from a device via physicalai.capture."""
+
+    if driver == "basler":
+        # TODO: Replace with cached Basler hardware discovery once implementated in physicalai.capture
+        return _formats_to_response([(640, 480, 30), (768, 480, 30), (1920, 1200, 30)])
+
+    try:
+        deserialized_fingerprint = json.loads(fingerprint_key)
+    except json.JSONDecodeError as e:
+        msg = f"Unable to parse fingerprint into a dictionary: {e}"
+        raise ValueError(msg)
+
+    if driver == "usb_camera":
+        from physicalai.capture import UVCCamera
+
+        return _formats_to_response(UVCCamera.query_formats(deserialized_fingerprint))
+
+    if driver == "realsense":
+        from physicalai.capture.cameras.realsense import RealSenseCamera
+
+        return _formats_to_response(RealSenseCamera.query_formats(deserialized_fingerprint))
+
+    msg = f"Format discovery not supported for driver {driver!r}"
+    raise ValueError(msg)
+
+
+@router.get("/supported_formats/{driver}")
+async def get_supported_formats(
+    driver: str,
+    fingerprint: str,
+) -> list[SupportedCameraFormat]:
+    """Returns the supported camera resolution and fps associated to the camera."""
+    try:
+        parsed = json.loads(fingerprint)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Unable to parse fingerprint into a dictionary: {e}") from e
+    if not isinstance(parsed, dict) or not parsed:
+        raise ValueError("Camera fingerprint must be a non-empty JSON object")
+    fingerprint_key = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+    return _query_formats(driver, fingerprint_key)
+
+
+def get_camera_from_query(websocket: WebSocket) -> ProjectCamera:
+    """Parse camera from query parameters."""
+    camera_param = websocket.query_params.get("camera")
+    if not camera_param:
+        raise ValueError("Missing 'camera' query parameter")
+
+    try:
+        camera_data = json.loads(camera_param)
+        return CameraAdapter.validate_python(camera_data)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in camera parameter: {e}")
+    except Exception as e:
+        raise ValueError(f"Invalid camera configuration: {e}")
+
+
+@router.get("/ws", tags=["WebSocket"], summary="Camera streaming (WebSocket)", status_code=426)
+async def camera_websocket_openapi(
+    camera: Annotated[str | None, Query(description="JSON-serialized ProjectCamera configuration")] = None,  # noqa: ARG001
+) -> Response:
+    """This endpoint requires a WebSocket connection. Use `wss://` to connect."""
+    return Response(status_code=426)
+
+
+@router.websocket("/ws")
+async def camera_websocket(
+    websocket: WebSocket,
+    claims: CameraClaimRegistryDep,
+    camera: Annotated[ProjectCamera, Depends(get_camera_from_query)],
+) -> None:
+    """
+    WebSocket endpoint for camera streaming.
+
+    Query Parameters:
+        camera: JSON serialized ProjectCamera
+
+    Protocol:
+        Client sends JSON message on connect:
+            camera: JSON serialized ProjectCamera
+
+        Server sends jpeg encoded bytes, or one JSON error before closing:
+            {"event": "error", "message": str, "error_code": str}
+    """
+    from utils.jpeg import encode_jpeg_rgb
+
+    await websocket.accept()
+
+    try:
+        if camera.fingerprint is None:
+            raise ValueError("Camera must be reselected")
+        if (claim := claims.holder_of(camera.fingerprint)) is not None:
+            raise DeviceInUseError(
+                device=f"Camera {camera.name!r}", holder=f"a runtime session in project {claim.project_name!r}"
+            )
+        # SharedCamera already captures in its own publisher process; a preview needs no worker.
+        shared_camera = build_shared_camera(config=camera, validate_on_connect=False, overwrite_settings=True)
+        await asyncio.to_thread(shared_camera.connect)
+        try:
+            rate = Rate(camera.payload.fps, name=f"camera-preview-{camera.name}")
+            sent: int | None = None
+            while True:
+                frame = await asyncio.to_thread(shared_camera.read_latest)
+                if frame.sequence != sent:
+                    await websocket.send_bytes(await asyncio.to_thread(encode_jpeg_rgb, frame.data))
+                    sent = frame.sequence
+                await rate.sleep()
+        finally:
+            # Shielded: a cancelled socket task must still detach from the publisher.
+            with anyio.CancelScope(shield=True):
+                await asyncio.to_thread(shared_camera.disconnect)
+    except WebSocketDisconnect:
+        pass
+    except DeviceInUseError as error:
+        await websocket.send_json(ErrorEvent(message=error.message, error_code=error.error_code).model_dump())
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
