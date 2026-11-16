@@ -391,7 +391,11 @@ class InternalLeRobotDataset(DatasetClient):
         from_idx = episode["dataset_from_index"]
         to_idx = episode["dataset_to_index"]
         actions = self._dataset.hf_dataset["action"][from_idx:to_idx]
-        return torch.stack(actions)
+        stacked = actions if isinstance(actions, torch.Tensor) else torch.stack(actions)
+        if stacked.ndim == 1 and tuple(self._dataset.features.get("action", {}).get("shape", ())) == (1,):
+            # LeRobot stores width-one features as scalars; the API keeps an action axis.
+            return stacked.unsqueeze(-1)
+        return stacked
 
     def _build_videos(self, episode: EpisodeMetadata) -> dict[str, EpisodeVideo]:
         """Build video info for episode."""
